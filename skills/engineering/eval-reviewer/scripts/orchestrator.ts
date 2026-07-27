@@ -1,289 +1,182 @@
-#!/usr/bin/env node
 /**
- * Eval Reviewer — runs each persona as an independent sandboxed agent, then
- * merges their findings into one report.
+ * eval-reviewer — every persona reviews the same target independently, then a
+ * deterministic merge compiles one report.
  *
- * Sandcastle owns process lifecycle, isolation, timeouts, and structured
- * output. This file owns configuration, prompt assembly, and the merge — the
- * merge is deliberately plain code so the same findings always produce the
- * same verdict.
+ * Everything tunable lives in eval-reviewer.config.ts. This file owns the run:
+ * load the config, assemble the prompts, drive Sandcastle, merge the findings.
+ * The merge is plain code on purpose — same findings in, same verdict out.
  *
- * Single file on purpose: it gets symlinked into a target repo as
- * `.sandcastle/eval-reviewer.ts`, and a symlink with no sibling imports runs
- * under bun, node (>=22.18, native type stripping), and `npx tsx` alike.
+ * Two ways to run a persona, chosen by `execution.mode`:
+ *   local  — the agent CLI on this machine, inheriting this shell. Whatever
+ *            authenticates your harness authenticates the review.
+ *   docker — one container per persona, carrying only what `docker.mounts`
+ *            and `docker.forwardEnv` hand it.
  *
- * Configuration is environment variables and flags — there is no config file.
- * Run with --help for the full list.
+ * Reached through scripts/review.ts, which installs the dependencies first.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  realpathSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-// Type-only, so it is erased at runtime and never needed at install time.
-import type { StandardSchemaV1 } from "@standard-schema/spec";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
-import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
 import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
+import { z } from "zod";
 
-// ─── Personas ────────────────────────────────────────────────────────────────
-// `name` must match a prompt file: <skill>/references/<name>.md.
-//
-// `critical: true` means the review is not trustworthy without this persona —
-// if one of them fails, the verdict is INCOMPLETE no matter what the others
-// found. A clean PASS that silently skipped the security review is a lie.
-
-const PERSONAS = [
-  { name: "skeptic", critical: true },
-  { name: "architect", critical: true },
-  { name: "security", critical: true },
-  { name: "minimalist", critical: false },
-  { name: "performance", critical: false },
-  { name: "test-coverage", critical: false },
-] as const;
+const SKILL_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // ─── Agents ──────────────────────────────────────────────────────────────────
-// Every agent Sandcastle ships is wired up. `credentials` is ordered by
-// preference and is what the run is checked against before any container
-// starts; the ones that are set get forwarded into the sandbox explicitly,
-// because Sandcastle's own resolver only forwards names that already appear in
-// `.sandcastle/.env` — a file that does not exist in CI.
+// Three CLIs, because those are the three harnesses people already have open.
+// Adding a fourth is one entry here — Sandcastle also ships cursor, opencode,
+// and copilot providers.
 
-type Effort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 interface AgentSpec {
-  /** Binary the agent runs as — checked on PATH when --sandbox none. */
+  /** Binary the agent runs as — checked on PATH in local mode. */
   readonly cli: string;
   /** What to `npm i -g` when that binary is missing. */
   readonly npmPackage: string;
-  readonly defaultModel: string;
-  /** Env var names holding this agent's credential, best first. */
-  readonly credentials: readonly string[];
-  /** Can this provider resume a session? Structured-output retries need it. */
-  readonly canResume: boolean;
-  readonly build: (opts: {
-    model: string;
-    effort: Effort | undefined;
-    env: Record<string, string>;
-    bypassPermissions: boolean;
-  }) => sandcastle.AgentProvider;
+  readonly build: (
+    model: string,
+    thinking: Thinking,
+    env: Record<string, string>
+  ) => sandcastle.AgentProvider;
 }
 
-const AGENTS: Record<string, AgentSpec> = {
+const AGENTS = {
+  pi: {
+    cli: "pi",
+    npmPackage: "@earendil-works/pi-coding-agent",
+    build: (model, thinking, env) =>
+      sandcastle.pi(model, { env, ...(thinking === "off" ? {} : { thinking }) }),
+  },
   "claude-code": {
     cli: "claude",
     npmPackage: "@anthropic-ai/claude-code",
-    defaultModel: "claude-sonnet-4-6",
-    credentials: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
-    canResume: true,
-    build: ({ model, effort, env, bypassPermissions }) =>
+    build: (model, thinking, env) =>
       sandcastle.claudeCode(model, {
         env,
-        ...(effort && effort !== "off" && effort !== "minimal"
-          ? { effort: effort as "low" | "medium" | "high" | "xhigh" }
-          : {}),
-        // Sandcastle passes --dangerously-skip-permissions only inside a
-        // container. Without one the flag is withheld, which leaves a -p run
-        // silently unable to grep or read — so it has to be asked for.
-        ...(bypassPermissions
-          ? { permissionMode: "bypassPermissions" as const }
-          : {}),
+        ...(thinking === "off" || thinking === "minimal"
+          ? {}
+          : { effort: thinking }),
+        // Outside a container Sandcastle withholds --dangerously-skip-permissions,
+        // which leaves a -p run unable to read or grep — a review that can see
+        // nothing. Each persona works in its own throwaway worktree and the
+        // prompts are reviewer-only, so the bypass is asked for explicitly.
+        permissionMode: "bypassPermissions",
       }),
-  },
-  pi: {
-    cli: "pi",
-    npmPackage: "@mariozechner/pi-coding-agent",
-    defaultModel: "claude-sonnet-4-6",
-    credentials: ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
-    canResume: true,
-    build: ({ model, effort, env }) =>
-      sandcastle.pi(model, { env, ...(effort ? { thinking: effort } : {}) }),
   },
   codex: {
     cli: "codex",
     npmPackage: "@openai/codex",
-    defaultModel: "gpt-5.4",
-    credentials: ["OPENAI_KEY", "OPENAI_API_KEY"],
-    canResume: true,
-    build: ({ model, effort, env }) =>
+    build: (model, thinking, env) =>
       sandcastle.codex(model, {
         env,
-        ...(effort && effort !== "off" && effort !== "minimal"
-          ? { effort: effort as "low" | "medium" | "high" | "xhigh" }
-          : {}),
+        ...(thinking === "off" || thinking === "minimal"
+          ? {}
+          : { effort: thinking }),
       }),
   },
-  cursor: {
-    cli: "cursor-agent",
-    npmPackage: "cursor-agent",
-    defaultModel: "composer-2",
-    credentials: ["CURSOR_API_KEY"],
-    canResume: false,
-    build: ({ model, env }) => sandcastle.cursor(model, { env }),
-  },
-  opencode: {
-    cli: "opencode",
-    npmPackage: "opencode-ai",
-    defaultModel: "opencode/big-pickle",
-    credentials: ["OPENCODE_API_KEY"],
-    canResume: false,
-    build: ({ model, env }) => sandcastle.opencode(model, { env }),
-  },
-  copilot: {
-    cli: "copilot",
-    npmPackage: "@github/copilot",
-    defaultModel: "claude-sonnet-4.5",
-    credentials: ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
-    canResume: false,
-    build: ({ model, env }) => sandcastle.copilot(model, { env }),
-  },
-};
+} as const satisfies Record<string, AgentSpec>;
 
-interface Mount {
-  hostPath: string;
-  sandboxPath: string;
-  readonly: boolean;
-}
+type AgentName = keyof typeof AGENTS;
 
-const SANDBOXES: Record<
-  string,
-  (image: string, mounts: Mount[]) => sandcastle.SandboxProvider
-> = {
-  docker: (image, mounts) => docker({ imageName: image, mounts }),
-  podman: (image, mounts) => podman({ imageName: image, mounts }),
-  none: () => noSandbox(),
-};
+// ─── Config ──────────────────────────────────────────────────────────────────
 
-// ─── Review payload ──────────────────────────────────────────────────────────
-// A hand-rolled Standard Schema validator. Sandcastle only needs the
-// `~standard.validate` contract, and this keeps the dependency list at exactly
-// one package — the whole skill installs in a couple of seconds.
-
+const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const SEVERITIES = ["critical", "high", "medium", "low"] as const;
 const VERDICTS = ["pass", "contest", "reject"] as const;
 
 type Severity = (typeof SEVERITIES)[number];
 type PersonaVerdict = (typeof VERDICTS)[number];
 
-interface Finding {
-  severity: Severity;
-  file: string;
-  line?: number;
-  message: string;
-  suggestion: string;
-}
+const ConfigSchema = z.object({
+  agent: z
+    .object({
+      provider: z.enum(["pi", "claude-code", "codex"]).default("pi"),
+      model: z.string().min(1).default("claude-sonnet-4-6"),
+      thinking: z.enum(THINKING).default("medium"),
+    })
+    .prefault({}),
+  execution: z
+    .object({
+      mode: z.enum(["local", "docker"]).default("local"),
+      concurrency: z.number().int().positive().default(3),
+      idleTimeoutSeconds: z.number().int().positive().default(600),
+      retries: z.number().int().nonnegative().default(2),
+    })
+    .prefault({}),
+  docker: z
+    .object({
+      image: z.string().min(1).default("sandcastle:eval-reviewer"),
+      mounts: z
+        .array(
+          z.object({
+            hostPath: z.string().min(1),
+            sandboxPath: z.string().min(1),
+            readonly: z.boolean().default(true),
+          })
+        )
+        .default([]),
+      forwardEnv: z.array(z.string().min(1)).default([]),
+    })
+    .prefault({}),
+  review: z
+    .object({
+      personas: z
+        .array(
+          z.object({
+            name: z.string().min(1),
+            critical: z.boolean().default(false),
+          })
+        )
+        .min(1)
+        .prefault([
+          { name: "skeptic", critical: true },
+          { name: "architect", critical: true },
+          { name: "security", critical: true },
+          { name: "minimalist", critical: false },
+          { name: "performance", critical: false },
+          { name: "test-coverage", critical: false },
+        ]),
+      failOn: z.enum([...SEVERITIES, "never"]).default("high"),
+      outDir: z.string().min(1).default(".eval-reviewer"),
+    })
+    .prefault({}),
+});
 
-interface ReviewPayload {
-  findings: Finding[];
-  verdict: PersonaVerdict;
-}
+type Config = z.infer<typeof ConfigSchema>;
+type Persona = Config["review"]["personas"][number];
 
-interface SchemaIssue {
-  message: string;
-  path: (string | number)[];
-}
+// ─── Review payload ──────────────────────────────────────────────────────────
 
-/** Validate one finding, collecting every problem so one retry can fix them all. */
-function validateFinding(
-  raw: unknown,
-  index: number,
-  issues: SchemaIssue[]
-): Finding | undefined {
-  if (typeof raw !== "object" || raw === null) {
-    issues.push({ message: "must be an object", path: ["findings", index] });
-    return undefined;
-  }
+const FindingSchema = z.object({
+  severity: z.enum(SEVERITIES),
+  file: z.string().min(1),
+  // Agents quote numbers and emit null about as often as they omit the key.
+  line: z.coerce.number().int().positive().nullish(),
+  message: z.string().min(1),
+  suggestion: z.string().min(1),
+});
 
-  const finding = raw as Record<string, unknown>;
-  const before = issues.length;
+const ReviewSchema = z.object({
+  findings: z.array(FindingSchema).default([]),
+  verdict: z.enum(VERDICTS),
+});
 
-  if (!SEVERITIES.includes(finding.severity as Severity)) {
-    issues.push({
-      message: `must be one of ${SEVERITIES.join(", ")}`,
-      path: ["findings", index, "severity"],
-    });
-  }
+type Finding = z.infer<typeof FindingSchema>;
 
-  for (const key of ["file", "message", "suggestion"]) {
-    if (typeof finding[key] !== "string" || finding[key] === "") {
-      issues.push({
-        message: "must be a non-empty string",
-        path: ["findings", index, key],
-      });
-    }
-  }
-
-  // Agents emit null about as often as they omit the key.
-  const hasLine = finding.line !== undefined && finding.line !== null;
-  if (
-    hasLine &&
-    (typeof finding.line !== "number" || !Number.isFinite(finding.line))
-  ) {
-    issues.push({
-      message: "must be a number, null, or omitted",
-      path: ["findings", index, "line"],
-    });
-  }
-
-  if (issues.length > before) return undefined;
-
-  return {
-    severity: finding.severity as Severity,
-    file: finding.file as string,
-    ...(hasLine ? { line: finding.line as number } : {}),
-    message: finding.message as string,
-    suggestion: finding.suggestion as string,
-  };
-}
-
-const reviewSchema: StandardSchemaV1<unknown, ReviewPayload> = {
-  "~standard": {
-    version: 1,
-    vendor: "eval-reviewer",
-    validate: (
-      value: unknown
-    ): { value: ReviewPayload } | { issues: SchemaIssue[] } => {
-      if (typeof value !== "object" || value === null) {
-        return { issues: [{ message: "must be an object", path: [] }] };
-      }
-
-      const root = value as Record<string, unknown>;
-      const issues: SchemaIssue[] = [];
-
-      if (!VERDICTS.includes(root.verdict as PersonaVerdict)) {
-        issues.push({
-          message: `must be one of ${VERDICTS.join(", ")}`,
-          path: ["verdict"],
-        });
-      }
-
-      if (!Array.isArray(root.findings)) {
-        issues.push({ message: "must be an array", path: ["findings"] });
-        return { issues };
-      }
-
-      const findings: Finding[] = [];
-      root.findings.forEach((raw, index) => {
-        const finding = validateFinding(raw, index, issues);
-        if (finding) findings.push(finding);
-      });
-
-      if (issues.length > 0) return { issues };
-
-      return { value: { findings, verdict: root.verdict as PersonaVerdict } };
-    },
-  },
-};
-
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ─── Constants ───────────────────────────────────────────────────────────────
 
 const OUTPUT_TAG = "review";
 const SEVERITY_SCORE: Record<Severity, number> = {
@@ -292,54 +185,27 @@ const SEVERITY_SCORE: Record<Severity, number> = {
   medium: 2,
   low: 1,
 };
-
 /** Past this, models start truncating the target — say so rather than pretend. */
 const TARGET_WARN_BYTES = 400_000;
 
-const USAGE = `eval-reviewer — six personas review the same target independently
+const USAGE = `eval-reviewer — every persona reviews the same target independently
 
 Usage:
-  eval-reviewer.ts <file-or-text>        review a diff file, a code file, or literal text
-  eval-reviewer.ts --diff <base-ref>     review \`git diff <base-ref>...HEAD\` (EVAL_DIFF)
+  review.ts <file-or-text>       review a diff file, a code file, or literal text
+  review.ts --diff <base-ref>    review \`git diff <base-ref>...HEAD\`
 
-Options (each has an env var; the flag wins):
-  --personas a,b,c   EVAL_PERSONAS     subset of ${PERSONAS.map((p) => p.name).join(", ")}
-  --agent NAME       EVAL_AGENT        ${Object.keys(AGENTS).join(", ")} (default: first with a credential set)
-  --model NAME       EVAL_MODEL        default: the agent's own default
-  --effort LEVEL     EVAL_EFFORT       off|minimal|low|medium|high|xhigh (default: medium)
-  --sandbox NAME     EVAL_SANDBOX      docker|podman|none (default: docker, none under CI)
-  --image NAME       EVAL_IMAGE        default: sandcastle:eval-reviewer-<agent>
-  --concurrency N    EVAL_CONCURRENCY  personas alive at once (default: 3)
-  --timeout N        EVAL_IDLE_TIMEOUT seconds without agent output before stuck (default: 600)
-  --retries N        EVAL_RETRIES      re-asks when output fails validation (default: 2)
-  --mounts LIST      EVAL_MOUNTS       host:sandbox[:ro] pairs, comma-separated
-  --repo PATH        EVAL_REPO         repo to review in (default: git root of cwd)
-  --out PATH         EVAL_OUT          report directory (default: <repo>/.eval-reviewer)
-  --fail-on LEVEL    EVAL_FAIL_ON      critical|high|medium|low|never (default: high)
+Options:
+  --config PATH    config file (default: <repo>/eval-reviewer.config.ts, else the skill's)
+  --mode NAME      local | docker — overrides the config for this run
+  --personas a,b   subset of the personas the config lists
+  --fail-on LEVEL  ${[...SEVERITIES, "never"].join(" | ")}
+  --repo PATH      repo to review in (default: git root of the working directory)
   --help
 
-Credentials come from your shell, then from <repo>/.sandcastle/.env. Nothing is written.
-Exit codes: 0 clean · 1 findings at/above --fail-on · 2 critical findings · 3 incomplete run`;
+Everything else lives in the config file. Exit codes:
+  0 clean · 1 findings at/above fail-on · 2 critical findings · 3 incomplete run`;
 
-interface Config {
-  target: string;
-  targetLabel: string;
-  personas: Array<{ name: string; critical: boolean }>;
-  agentName: string;
-  agent: AgentSpec;
-  model: string;
-  effort: Effort | undefined;
-  sandboxName: string;
-  image: string;
-  mounts: Mount[];
-  concurrency: number;
-  idleTimeout: number;
-  retries: number;
-  repoRoot: string;
-  outDir: string;
-  failOn: Severity | "never";
-  skillRoot: string;
-}
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function fail(message: string, ...detail: string[]): never {
   console.error(`eval-reviewer: ${message}`);
@@ -360,90 +226,26 @@ function onPath(binary: string): boolean {
   }
 }
 
-function imageExists(runtime: string, image: string): boolean {
-  try {
-    execFileSync(runtime, ["image", "inspect", image], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
+function expandTilde(path: string): string {
+  return path.startsWith("~") ? join(homedir(), path.slice(1)) : path;
 }
 
-/**
- * Credentials the repo keeps in `.sandcastle/.env` — the file Sandcastle's own
- * docs tell you to put them in. Populated once the repo root is known.
- */
-let dotEnv: Record<string, string> = {};
-
-/** Minimal KEY=VALUE reader. Missing file, blank lines, and comments are fine. */
-function parseDotEnv(path: string): Record<string, string> {
-  if (!existsSync(path)) return {};
-
-  const vars: Record<string, string> = {};
-  for (const line of readFileSync(path, "utf-8").split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed === "" || trimmed.startsWith("#")) continue;
-    const separator = trimmed.indexOf("=");
-    if (separator === -1) continue;
-    const key = trimmed.slice(0, separator).trim();
-    const value = trimmed.slice(separator + 1).trim();
-    const quoted =
-      value.length >= 2 &&
-      (value[0] === '"' || value[0] === "'") &&
-      value[value.length - 1] === value[0];
-    vars[key] = quoted ? value.slice(1, -1) : value;
-  }
-  return vars;
+interface Flags {
+  config?: string;
+  mode?: string;
+  personas?: string;
+  "fail-on"?: string;
+  repo?: string;
+  diff?: string;
+  _: string[];
 }
 
-/** The shell wins over the file, so a one-off export overrides the checked-in default. */
-function credential(key: string): string | undefined {
-  return process.env[key] || dotEnv[key] || undefined;
-}
-
-/**
- * `host:sandbox` or `host:sandbox:ro`, comma-separated. What this is for: an
- * agent that reaches a custom OpenAI-compatible endpoint reads its provider
- * definition from a file on the host (pi's `~/.pi/agent/models.json`), and the
- * sandboxed copy has to see the same file.
- */
-function parseMounts(raw: string | undefined): Mount[] {
-  if (!raw) return [];
-
-  return raw
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .map((entry) => {
-      const parts = entry.split(":").map((part) => part.trim());
-      if (parts.length < 2 || parts.length > 3 || parts.some((p) => p === "")) {
-        fail(
-          `bad mount "${entry}".`,
-          "Expected host:sandbox or host:sandbox:ro, comma-separated."
-        );
-      }
-      const [hostPath, sandboxPath, mode] = parts;
-      if (mode !== undefined && mode !== "ro" && mode !== "rw") {
-        fail(`bad mount mode "${mode}" in "${entry}" — use ro or rw.`);
-      }
-      return { hostPath, sandboxPath, readonly: mode === "ro" };
-    });
-}
-
-/** Pick the first agent whose credential is already available. */
-function detectAgent(): string | undefined {
-  for (const [name, spec] of Object.entries(AGENTS)) {
-    if (spec.credentials.some((key) => credential(key))) return name;
-  }
-  return undefined;
-}
-
-function parseConfig(argv: string[], skillRoot: string): Config {
-  const flags: Record<string, string> = {};
+function parseFlags(argv: string[]): Flags {
+  const named: Record<string, string> = {};
   const positional: string[] = [];
 
   for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
+    const arg = argv[i]!;
     if (arg === "--help" || arg === "-h") {
       console.log(USAGE);
       process.exit(0);
@@ -454,7 +256,7 @@ function parseConfig(argv: string[], skillRoot: string): Config {
     }
     const separator = arg.indexOf("=");
     if (separator !== -1) {
-      flags[arg.slice(2, separator)] = arg.slice(separator + 1);
+      named[arg.slice(2, separator)] = arg.slice(separator + 1);
       continue;
     }
     const key = arg.slice(2);
@@ -462,250 +264,254 @@ function parseConfig(argv: string[], skillRoot: string): Config {
     if (next === undefined || next.startsWith("--")) {
       fail(`--${key} needs a value.`, "Run --help for the full list.");
     }
-    flags[key] = next;
+    named[key] = next;
     i++;
   }
 
-  const pick = (flag: string, envVar: string, fallback?: string) =>
-    flags[flag] ?? process.env[envVar] ?? fallback;
+  return { ...named, _: positional };
+}
 
-  const repoRoot = (() => {
-    const explicit = pick("repo", "EVAL_REPO");
-    if (explicit) {
-      const abs = resolve(explicit);
-      if (!existsSync(join(abs, ".git"))) {
-        fail(`--repo ${explicit} is not a git repository (no .git).`);
-      }
-      return abs;
+function resolveRepo(explicit: string | undefined): string {
+  if (explicit) {
+    const abs = resolve(explicit);
+    if (!existsSync(join(abs, ".git"))) {
+      fail(`--repo ${explicit} is not a git repository (no .git).`);
     }
+    return abs;
+  }
+  try {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      encoding: "utf-8",
+    }).trim();
+  } catch {
+    return fail(
+      "not inside a git repository — each persona reviews in a worktree, so one is required.",
+      "Run from the repo you're reviewing, or pass --repo PATH."
+    );
+  }
+}
+
+/** The repo's config wins over the skill's default; neither has to exist. */
+async function loadConfig(
+  explicit: string | undefined,
+  repoRoot: string
+): Promise<{ config: Config; configPath: string }> {
+  const candidates = explicit
+    ? [resolve(explicit)]
+    : [
+        join(repoRoot, "eval-reviewer.config.ts"),
+        join(SKILL_ROOT, "eval-reviewer.config.ts"),
+      ];
+
+  const configPath = candidates.find((candidate) => existsSync(candidate));
+  if (!configPath) fail(`config not found: ${candidates.join(", ")}`);
+
+  const module = (await import(pathToFileURL(configPath).href)) as {
+    default?: unknown;
+  };
+  const parsed = ConfigSchema.safeParse(module.default ?? {});
+  if (!parsed.success) {
+    fail(
+      `${configPath} is not a valid config.`,
+      ...parsed.error.issues.map(
+        (issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`
+      )
+    );
+  }
+
+  return { config: parsed.data, configPath };
+}
+
+/** A file path, literal text, or a diff computed here. Never a URL — nothing is fetched. */
+function resolveTarget(
+  flags: Flags,
+  repoRoot: string
+): { target: string; label: string } {
+  if (flags.diff) {
+    const label = `git diff ${flags.diff}...HEAD`;
+    let target: string;
     try {
-      return execFileSync("git", ["rev-parse", "--show-toplevel"], {
-        cwd: process.cwd(),
-        encoding: "utf-8",
-      }).trim();
-    } catch {
-      return fail(
-        "not inside a git repository — each persona reviews in a worktree, so one is required.",
-        "Run from the repo you're reviewing, or pass --repo PATH."
-      );
-    }
-  })();
-
-  dotEnv = parseDotEnv(join(repoRoot, ".sandcastle", ".env"));
-
-  // The target is a file, literal text, or a diff this script computes itself.
-  const diffBase = pick("diff", "EVAL_DIFF");
-  let target: string;
-  let targetLabel: string;
-
-  if (diffBase) {
-    targetLabel = `git diff ${diffBase}...HEAD`;
-    try {
-      target = execFileSync("git", ["diff", `${diffBase}...HEAD`], {
+      target = execFileSync("git", ["diff", `${flags.diff}...HEAD`], {
         cwd: repoRoot,
         encoding: "utf-8",
         maxBuffer: 64 * 1024 * 1024,
       });
     } catch (error) {
       return fail(
-        `${targetLabel} failed in ${repoRoot}.`,
+        `${label} failed in ${repoRoot}.`,
         error instanceof Error ? error.message : String(error),
         "In CI, fetch the base ref first — actions/checkout with fetch-depth: 0."
       );
     }
-    if (target.trim() === "") fail(`${targetLabel} is empty — nothing to review.`);
-  } else if (positional.length > 0) {
-    const path = resolve(positional[0]);
-    const isFile = existsSync(path);
-    target = isFile ? readFileSync(path, "utf-8") : positional.join(" ");
-    targetLabel = isFile ? positional[0] : "inline text";
-  } else {
+    if (target.trim() === "") fail(`${label} is empty — nothing to review.`);
+    return { target, label };
+  }
+
+  if (flags._.length === 0) {
     console.error(USAGE);
-    return process.exit(1);
+    process.exit(1);
   }
 
-  const targetBytes = Buffer.byteLength(target);
-  if (targetBytes > TARGET_WARN_BYTES) {
-    console.warn(
-      `eval-reviewer: target is ${Math.round(targetBytes / 1024)}KB — large enough ` +
-        `that agents may truncate it. Consider reviewing fewer files at once.`
-    );
-  }
+  const path = resolve(flags._[0]!);
+  return existsSync(path)
+    ? { target: readFileSync(path, "utf-8"), label: flags._[0]! }
+    : { target: flags._.join(" "), label: "inline text" };
+}
 
-  const agentName =
-    pick("agent", "EVAL_AGENT") ??
-    detectAgent() ??
-    fail(
-      "no agent credential found in the environment.",
-      ...Object.entries(AGENTS).map(
-        ([name, spec]) => `${name}: ${spec.credentials.join(" or ")}`
-      ),
-      "Export one, or pick an agent explicitly with --agent."
-    );
+// ─── Preflight ───────────────────────────────────────────────────────────────
+// Everything knowably broken, checked before the first agent starts. A problem
+// found here costs a second; found later it costs six agent runs.
 
-  const agent = AGENTS[agentName];
-  if (!agent) {
-    fail(
-      `unknown agent "${agentName}".`,
-      `Available: ${Object.keys(AGENTS).join(", ")}.`
-    );
-  }
+interface Runtime {
+  agentName: AgentName;
+  /** Explicitly forwarded into the sandbox. Empty in local mode — it inherits. */
+  agentEnv: Record<string, string>;
+  sandbox: () => sandcastle.SandboxProvider;
+  /** What the header prints as the source of the agent's credentials. */
+  authNote: string;
+}
 
-  const sandboxName = pick(
-    "sandbox",
-    "EVAL_SANDBOX",
-    // A CI runner is already a disposable VM; a container inside it buys
-    // nothing and costs an image build on every run.
-    process.env.CI ? "none" : "docker"
-  ) as string;
-  if (!SANDBOXES[sandboxName]) {
-    fail(
-      `unknown sandbox "${sandboxName}".`,
-      `Available: ${Object.keys(SANDBOXES).join(", ")}.`
-    );
-  }
+function preflight(config: Config, mode: "local" | "docker"): Runtime {
+  const agentName = config.agent.provider;
+  const agent: AgentSpec = AGENTS[agentName];
 
-  const requestedPersonas = pick("personas", "EVAL_PERSONAS");
-  const personas = (() => {
-    const all = PERSONAS.map((p) => ({ name: p.name, critical: p.critical }));
-    if (!requestedPersonas) return all;
-    const names = requestedPersonas
-      .split(",")
-      .map((name) => name.trim().toLowerCase())
-      .filter(Boolean);
-    const unknown = names.filter((name) => !all.some((p) => p.name === name));
-    if (unknown.length > 0) {
+  for (const persona of config.review.personas) {
+    const prompt = join(SKILL_ROOT, "references", `${persona.name}.md`);
+    if (!existsSync(prompt)) {
       fail(
-        `unknown persona(s): ${unknown.join(", ")}.`,
-        `Available: ${all.map((p) => p.name).join(", ")}.`
+        `no prompt for persona "${persona.name}".`,
+        `Expected ${prompt} — every name in review.personas needs one.`
       );
     }
-    return all.filter((p) => names.includes(p.name));
-  })();
+  }
 
-  const number = (flag: string, envVar: string, fallback: number): number => {
-    const raw = pick(flag, envVar);
-    if (raw === undefined) return fallback;
-    const parsed = Number(raw);
-    if (!Number.isInteger(parsed) || parsed < 0) {
-      fail(`--${flag} must be a non-negative integer, got "${raw}".`);
+  if (mode === "local") {
+    // No credential check, on purpose. A locally installed CLI carries its own
+    // auth — an OAuth token on disk, a provider registry, an exported key — and
+    // demanding one specific variable is what blocked runs that would have
+    // worked. If the CLI is there, authenticating is the harness's job.
+    if (!onPath(agent.cli)) {
+      fail(
+        `local mode runs "${agent.cli}" on this machine, but it is not on PATH.`,
+        `Install it with: npm i -g ${agent.npmPackage}`,
+        `Or set execution.mode to "docker" in the config.`
+      );
     }
-    return parsed;
-  };
-
-  const efforts: Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
-  const effort = pick("effort", "EVAL_EFFORT", "medium") as Effort;
-  if (!efforts.includes(effort)) {
-    fail(`--effort must be one of ${efforts.join(", ")}, got "${effort}".`);
+    return {
+      agentName,
+      agentEnv: {},
+      sandbox: () => noSandbox(),
+      authNote: `${agent.cli} on this host (inherits this shell)`,
+    };
   }
 
-  const failOn = pick("fail-on", "EVAL_FAIL_ON", "high") as Severity | "never";
-  if (failOn !== "never" && !SEVERITIES.includes(failOn as Severity)) {
+  if (!onPath("docker")) {
     fail(
-      `--fail-on must be one of ${SEVERITIES.join(", ")}, never — got "${failOn}".`
+      "docker mode needs docker on PATH.",
+      'Install it, or set execution.mode to "local" in the config.'
     );
   }
 
-  const retries = number("retries", "EVAL_RETRIES", 2);
-  if (retries > 0 && !agent.canResume) {
-    console.warn(
-      `eval-reviewer: ${agentName} cannot resume a session, so validation retries are off.`
+  // A container gets none of the host's auth. What reaches it is exactly these
+  // two lists, so anything missing is worth saying out loud now — before the
+  // image build, which is the slow part.
+  const agentEnv: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const key of config.docker.forwardEnv) {
+    const value = process.env[key];
+    if (value) agentEnv[key] = value;
+    else missing.push(key);
+  }
+
+  const mounts = config.docker.mounts
+    .map((mount) => ({ ...mount, hostPath: expandTilde(mount.hostPath) }))
+    .filter((mount) => {
+      if (existsSync(mount.hostPath)) return true;
+      console.warn(
+        `eval-reviewer: skipping mount ${mount.hostPath} — no such path on this host.`
+      );
+      return false;
+    });
+
+  if (Object.keys(agentEnv).length === 0 && mounts.length === 0) {
+    fail(
+      "docker mode would start a container with no way to authenticate.",
+      "Set docker.forwardEnv to the variables your provider needs, or",
+      "docker.mounts to the config directory it reads (~/.pi/agent for pi)."
     );
   }
+  if (missing.length > 0) {
+    console.warn(
+      `eval-reviewer: docker.forwardEnv names ${missing.join(", ")} — unset in this shell, not forwarded.`
+    );
+  }
+
+  ensureImage(config, agentName);
 
   return {
-    target,
-    targetLabel,
-    personas,
     agentName,
-    agent,
-    model: pick("model", "EVAL_MODEL", agent.defaultModel) as string,
-    effort: effort === "off" ? undefined : effort,
-    sandboxName,
-    image: pick(
-      "image",
-      "EVAL_IMAGE",
-      `sandcastle:eval-reviewer-${agentName}`
-    ) as string,
-    mounts: parseMounts(pick("mounts", "EVAL_MOUNTS")),
-    concurrency: Math.max(1, number("concurrency", "EVAL_CONCURRENCY", 3)),
-    idleTimeout: Math.max(1, number("timeout", "EVAL_IDLE_TIMEOUT", 600)),
-    retries: agent.canResume ? retries : 0,
-    repoRoot,
-    outDir: resolve(
-      pick("out", "EVAL_OUT", join(repoRoot, ".eval-reviewer")) as string
-    ),
-    failOn,
-    skillRoot,
+    agentEnv,
+    sandbox: () => docker({ imageName: config.docker.image, mounts }),
+    authNote: `container: ${
+      [...Object.keys(agentEnv), ...mounts.map((mount) => mount.hostPath)].join(
+        ", "
+      ) || "nothing forwarded"
+    }`,
   };
 }
 
-/**
- * Everything knowably broken before a container starts, checked before one
- * does. A missing key otherwise surfaces as six agents erroring at once,
- * several minutes and one image pull later.
- */
-function preflight(config: Config): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const key of config.agent.credentials) {
-    const value = credential(key);
-    if (value) env[key] = value;
+/** Build the sandbox image on first use, so there is no setup step to forget. */
+function ensureImage(config: Config, agentName: AgentName): void {
+  try {
+    execFileSync("docker", ["image", "inspect", config.docker.image], {
+      stdio: "ignore",
+    });
+    return;
+  } catch {
+    // Not built yet — fall through and build it.
   }
 
-  if (Object.keys(env).length === 0) {
+  console.log(
+    `  building ${config.docker.image} (one time, a couple of minutes)…`
+  );
+  const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
+  const gid = typeof process.getgid === "function" ? process.getgid() : 1000;
+
+  const result = spawnSync(
+    "docker",
+    [
+      "build",
+      "-t",
+      config.docker.image,
+      "--build-arg",
+      `AGENT_NPM_PACKAGE=${AGENTS[agentName].npmPackage}`,
+      "--build-arg",
+      `AGENT_UID=${uid}`,
+      "--build-arg",
+      `AGENT_GID=${gid}`,
+      join(SKILL_ROOT, "docker"),
+    ],
+    { stdio: "inherit" }
+  );
+
+  if (result.status !== 0) {
     fail(
-      `no credential for ${config.agentName}.`,
-      `Export one of: ${config.agent.credentials.join(", ")}`,
-      `— or put it in ${join(config.repoRoot, ".sandcastle", ".env")}.`,
-      config.agentName === "claude-code"
-        ? "Run `claude setup-token` for a CLAUDE_CODE_OAUTH_TOKEN."
-        : ""
+      `could not build ${config.docker.image}.`,
+      'Set execution.mode to "local" to review without a container.'
     );
   }
-
-  if (config.sandboxName === "none") {
-    if (config.mounts.length > 0) {
-      console.warn(
-        `eval-reviewer: --mounts has no meaning with --sandbox none (the agent already sees this filesystem).`
-      );
-    }
-    if (!onPath(config.agent.cli)) {
-      fail(
-        `--sandbox none runs the agent on this host, but "${config.agent.cli}" is not on PATH.`,
-        `Install it with: npm i -g ${config.agent.npmPackage}`
-      );
-    }
-  } else {
-    if (!onPath(config.sandboxName)) {
-      fail(`${config.sandboxName} is not on PATH.`);
-    }
-    if (!imageExists(config.sandboxName, config.image)) {
-      fail(
-        `sandbox image "${config.image}" does not exist.`,
-        `Build it once with: node ${join(config.skillRoot, "scripts", "setup.mjs")} --build`,
-        `Or skip the container and run on this host with: --sandbox none`
-      );
-    }
-  }
-
-  for (const persona of config.personas) {
-    const prompt = join(config.skillRoot, "references", `${persona.name}.md`);
-    if (!existsSync(prompt)) fail(`persona prompt not found: ${prompt}`);
-  }
-
-  return env;
 }
 
-// ─── Prompt assembly ─────────────────────────────────────────────────────────
+// ─── Review execution ────────────────────────────────────────────────────────
 
 /**
  * The target is embedded literally rather than passed through Sandcastle's
- * `promptArgs`/`promptFile` pipeline, so nothing inside the reviewed diff is
- * ever treated as a placeholder or a shell expression.
+ * promptArgs/promptFile pipeline, so nothing inside the reviewed diff is ever
+ * treated as a placeholder or a shell expression.
  */
-function assemblePrompt(persona: string, config: Config): string {
+function assemblePrompt(persona: string, target: string): string {
   const personaPrompt = readFileSync(
-    join(config.skillRoot, "references", `${persona}.md`),
+    join(SKILL_ROOT, "references", `${persona}.md`),
     "utf-8"
   );
 
@@ -718,7 +524,7 @@ ${personaPrompt}
 ## Code to Review
 
 \`\`\`
-${config.target}
+${target}
 \`\`\`
 
 ## Instructions
@@ -732,58 +538,59 @@ This is a review. Report what you find; leave the code as you found it.
 `;
 }
 
-// ─── Review execution ────────────────────────────────────────────────────────
-
 interface AgentResult {
   persona: string;
   status: "done" | "failed";
   findings: Finding[];
   verdict: PersonaVerdict;
-  /** Why this persona failed — surfaced in the report so a silent gap is impossible. */
+  /** Why this persona failed — in the report, so a silent gap is impossible. */
   error?: string;
 }
 
+interface RunContext {
+  config: Config;
+  runtime: Runtime;
+  target: string;
+  repoRoot: string;
+  outDir: string;
+}
+
 async function reviewWith(
-  persona: { name: string; critical: boolean },
-  config: Config,
-  agentEnv: Record<string, string>
+  persona: Persona,
+  context: RunContext
 ): Promise<AgentResult> {
-  const logPath = join(config.outDir, persona.name, "agent.log");
+  const { config, runtime, target, repoRoot, outDir } = context;
+  const logPath = join(outDir, persona.name, "agent.log");
   mkdirSync(dirname(logPath), { recursive: true });
 
   try {
     const result = await sandcastle.run({
-      agent: config.agent.build({
-        model: config.model,
-        effort: config.effort,
-        env: agentEnv,
-        // Outside a container Sandcastle withholds the bypass flag. On an
-        // ephemeral CI runner that only costs the review its tools; on a
-        // developer's own machine the permission gate is worth keeping.
-        bypassPermissions:
-          config.sandboxName === "none" && Boolean(process.env.CI),
-      }),
-      sandbox: SANDBOXES[config.sandboxName](config.image, config.mounts),
-      cwd: config.repoRoot,
+      agent: AGENTS[runtime.agentName].build(
+        config.agent.model,
+        config.agent.thinking,
+        runtime.agentEnv
+      ),
+      sandbox: runtime.sandbox(),
+      cwd: repoRoot,
       name: persona.name,
-      prompt: assemblePrompt(persona.name, config),
+      prompt: assemblePrompt(persona.name, target),
       // Structured output requires a single iteration.
       maxIterations: 1,
-      // Its own branch, so concurrent personas never share a working directory.
+      // Its own branch, so concurrent personas never share a working directory
+      // and nothing a persona writes reaches the tree you are working in.
       branchStrategy: { type: "branch", branch: `eval-review/${persona.name}` },
-      idleTimeoutSeconds: config.idleTimeout,
+      idleTimeoutSeconds: config.execution.idleTimeoutSeconds,
       logging: { type: "file", path: logPath },
       output: sandcastle.Output.object({
         tag: OUTPUT_TAG,
-        schema: reviewSchema,
-        maxRetries: config.retries,
+        schema: ReviewSchema,
+        maxRetries: config.execution.retries,
       }),
     });
 
     console.log(
       `  ✓ ${persona.name} — ${result.output.findings.length} findings, verdict: ${result.output.verdict}`
     );
-
     return {
       persona: persona.name,
       status: "done",
@@ -793,7 +600,6 @@ async function reviewWith(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.log(`  ✗ ${persona.name} — failed: ${message}`);
-
     return {
       persona: persona.name,
       status: "failed",
@@ -804,19 +610,20 @@ async function reviewWith(
   }
 }
 
-/** Run personas in batches so N agents are alive at once, not all of them. */
+/** Run personas in batches, so N agents are alive at once rather than all of them. */
 async function runReviews(
-  config: Config,
-  agentEnv: Record<string, string>
+  personas: Persona[],
+  context: RunContext
 ): Promise<AgentResult[]> {
   const results: AgentResult[] = [];
+  const { concurrency } = context.config.execution;
 
-  for (let i = 0; i < config.personas.length; i += config.concurrency) {
-    const batch = config.personas.slice(i, i + config.concurrency);
+  for (let i = 0; i < personas.length; i += concurrency) {
+    const batch = personas.slice(i, i + concurrency);
     console.log(`\n  Reviewing: ${batch.map((p) => p.name).join(", ")}`);
     results.push(
       ...(await Promise.all(
-        batch.map((persona) => reviewWith(persona, config, agentEnv))
+        batch.map((persona) => reviewWith(persona, context))
       ))
     );
   }
@@ -866,14 +673,15 @@ interface Verdict {
   target: string;
   agent: string;
   model: string;
-  sandbox: string;
+  mode: string;
   timestamp: string;
 }
 
 function buildVerdict(
   results: AgentResult[],
   findings: Finding[],
-  config: Config
+  personas: Persona[],
+  meta: { target: string; agent: string; model: string; mode: string }
 ): Verdict {
   const breakdown: Record<Severity, number> = {
     critical: 0,
@@ -884,7 +692,7 @@ function buildVerdict(
   for (const finding of findings) breakdown[finding.severity]++;
 
   const criticalPersonas = new Set(
-    config.personas.filter((p) => p.critical).map((p) => p.name)
+    personas.filter((persona) => persona.critical).map((persona) => persona.name)
   );
 
   // A review missing one of its load-bearing angles cannot be reported at all.
@@ -921,10 +729,7 @@ function buildVerdict(
         },
       ])
     ),
-    target: config.targetLabel,
-    agent: config.agentName,
-    model: config.model,
-    sandbox: config.sandboxName,
+    ...meta,
     timestamp: new Date().toISOString(),
   };
 }
@@ -939,7 +744,7 @@ function renderReport(
   out.push(`# Code Review Report\n`);
   out.push(`**Target**: \`${verdict.target}\`  `);
   out.push(
-    `**Reviewed by**: ${verdict.agent} (${verdict.model}) in sandbox \`${verdict.sandbox}\`  `
+    `**Reviewed by**: ${verdict.agent} (${verdict.model}), ${verdict.mode} mode  `
   );
   out.push(`**Date**: ${verdict.timestamp.split("T")[0]}  `);
   out.push(`**Verdict**: **${verdict.overall}**\n`);
@@ -956,7 +761,7 @@ function renderReport(
   out.push(`| Persona | Critical | Status | Findings | Verdict |`);
   out.push(`|---------|----------|--------|----------|---------|`);
   for (const result of results) {
-    const entry = verdict.agents[result.persona];
+    const entry = verdict.agents[result.persona]!;
     out.push(
       `| ${result.persona} | ${entry.critical ? "yes" : "no"} | ${result.status} | ${result.findings.length} | ${result.verdict} |`
     );
@@ -993,72 +798,119 @@ function renderReport(
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-async function main() {
-  // realpath: this file is normally reached through a symlink in the target
-  // repo's .sandcastle/, and references/ lives next to the real file.
-  const skillRoot = dirname(
-    dirname(realpathSync(fileURLToPath(import.meta.url)))
-  );
+const flags = parseFlags(process.argv.slice(2));
+const repoRoot = resolveRepo(flags.repo);
+const { config, configPath } = await loadConfig(flags.config, repoRoot);
 
-  const config = parseConfig(process.argv.slice(2), skillRoot);
-  const agentEnv = preflight(config);
-
-  mkdirSync(config.outDir, { recursive: true });
-  // Self-ignoring output directory — nothing to add to the repo's .gitignore.
-  writeFileSync(join(config.outDir, ".gitignore"), "*\n");
-
-  console.log(`\n  eval-reviewer`);
-  console.log(`  Target:      ${config.targetLabel}`);
-  console.log(`  Agent:       ${config.agentName} (${config.model})`);
-  console.log(
-    `  Sandbox:     ${config.sandboxName}${config.sandboxName === "none" ? " (this host)" : ` (${config.image})`}`
-  );
-  console.log(`  Personas:    ${config.personas.map((p) => p.name).join(", ")}`);
-  console.log(`  Repo:        ${config.repoRoot}`);
-  console.log(`  Report:      ${config.outDir}`);
-  console.log(`  Credentials: ${Object.keys(agentEnv).join(", ")}`);
-
-  const results = await runReviews(config, agentEnv);
-  const findings = mergeFindings(results);
-  const verdict = buildVerdict(results, findings, config);
-  const report = renderReport(results, findings, verdict);
-
-  writeFileSync(join(config.outDir, "report.md"), report);
-  writeFileSync(
-    join(config.outDir, "verdict.json"),
-    `${JSON.stringify(verdict, null, 2)}\n`
-  );
-
-  // In GitHub Actions the report belongs on the run page, not only in an artifact.
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    try {
-      appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${report}\n`);
-    } catch (error) {
-      console.warn(
-        `eval-reviewer: could not write the job summary: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
-
-  console.log(`\n  Report:  ${join(config.outDir, "report.md")}`);
-  console.log(`  Verdict: ${join(config.outDir, "verdict.json")}`);
-  console.log(`\n  ═══════ VERDICT: ${verdict.overall} ═══════\n`);
-
-  // An incomplete run is always a failure — it is not a clean result, it is an
-  // unknown one. Otherwise the gate is whatever --fail-on asked for.
-  if (verdict.overall === "INCOMPLETE") process.exit(3);
-  if (config.failOn === "never") process.exit(0);
-
-  const threshold = SEVERITY_SCORE[config.failOn];
-  const worst = findings.reduce(
-    (max, finding) => Math.max(max, SEVERITY_SCORE[finding.severity]),
-    0
-  );
-  if (worst < threshold) process.exit(0);
-  process.exit(worst === SEVERITY_SCORE.critical ? 2 : 1);
+// A CI runner is already a disposable VM: a container inside it buys nothing
+// and costs an image build every run. Its secrets are in the environment,
+// which is exactly what local mode inherits.
+const mode = flags.mode ?? (process.env.CI ? "local" : config.execution.mode);
+if (mode !== "local" && mode !== "docker") {
+  fail(`--mode must be local or docker, got "${mode}".`);
 }
 
-main().catch((error) => {
-  console.error("eval-reviewer: orchestrator failed:", error);
-  process.exit(1);
+const failOn = (flags["fail-on"] ?? config.review.failOn) as Severity | "never";
+if (failOn !== "never" && !SEVERITIES.includes(failOn)) {
+  fail(
+    `--fail-on must be one of ${SEVERITIES.join(", ")}, never — got "${failOn}".`
+  );
+}
+
+const personas = (() => {
+  if (!flags.personas) return config.review.personas;
+  const names = flags.personas
+    .split(",")
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean);
+  const unknown = names.filter(
+    (name) => !config.review.personas.some((persona) => persona.name === name)
+  );
+  if (unknown.length > 0) {
+    fail(
+      `unknown persona(s): ${unknown.join(", ")}.`,
+      `The config lists: ${config.review.personas.map((p) => p.name).join(", ")}.`
+    );
+  }
+  return config.review.personas.filter((persona) =>
+    names.includes(persona.name)
+  );
+})();
+
+const { target, label } = resolveTarget(flags, repoRoot);
+const targetBytes = Buffer.byteLength(target);
+if (targetBytes > TARGET_WARN_BYTES) {
+  console.warn(
+    `eval-reviewer: target is ${Math.round(targetBytes / 1024)}KB — large enough ` +
+      `that models may truncate it. Consider reviewing fewer files at once.`
+  );
+}
+
+const runtime = preflight(config, mode);
+
+const outDir = isAbsolute(config.review.outDir)
+  ? config.review.outDir
+  : join(repoRoot, config.review.outDir);
+mkdirSync(outDir, { recursive: true });
+// Self-ignoring output directory — nothing to add to the repo's .gitignore.
+writeFileSync(join(outDir, ".gitignore"), "*\n");
+
+console.log(`\n  eval-reviewer`);
+console.log(`  Target:   ${label}`);
+console.log(`  Agent:    ${runtime.agentName} (${config.agent.model})`);
+console.log(`  Mode:     ${mode}`);
+console.log(`  Auth:     ${runtime.authNote}`);
+console.log(`  Personas: ${personas.map((persona) => persona.name).join(", ")}`);
+console.log(`  Config:   ${configPath}`);
+console.log(`  Report:   ${outDir}`);
+
+const results = await runReviews(personas, {
+  config,
+  runtime,
+  target,
+  repoRoot,
+  outDir,
 });
+const findings = mergeFindings(results);
+const verdict = buildVerdict(results, findings, personas, {
+  target: label,
+  agent: runtime.agentName,
+  model: config.agent.model,
+  mode,
+});
+const report = renderReport(results, findings, verdict);
+
+writeFileSync(join(outDir, "report.md"), report);
+writeFileSync(
+  join(outDir, "verdict.json"),
+  `${JSON.stringify(verdict, null, 2)}\n`
+);
+
+// In GitHub Actions the report belongs on the run page, not only in an artifact.
+if (process.env.GITHUB_STEP_SUMMARY) {
+  try {
+    appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${report}\n`);
+  } catch (error) {
+    console.warn(
+      `eval-reviewer: could not write the job summary: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+}
+
+console.log(`\n  Report:  ${join(outDir, "report.md")}`);
+console.log(`  Verdict: ${join(outDir, "verdict.json")}`);
+console.log(`\n  ═══════ VERDICT: ${verdict.overall} ═══════\n`);
+
+// An incomplete run is always a failure — it is not a clean result, it is an
+// unknown one. Otherwise the gate is whatever fail-on asked for.
+if (verdict.overall === "INCOMPLETE") process.exit(3);
+if (failOn === "never") process.exit(0);
+
+const threshold = SEVERITY_SCORE[failOn];
+const worst = findings.reduce(
+  (max, finding) => Math.max(max, SEVERITY_SCORE[finding.severity]),
+  0
+);
+process.exit(worst < threshold ? 0 : worst === SEVERITY_SCORE.critical ? 2 : 1);

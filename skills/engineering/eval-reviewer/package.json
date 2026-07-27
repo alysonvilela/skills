@@ -1,19 +1,18 @@
 {
   "name": "eval-reviewer",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Multi-agent parallel code review with 6 specialized personas",
   "type": "module",
   "scripts": {
-    "setup": "node scripts/setup.mjs",
-    "review": "node scripts/orchestrator.ts",
+    "review": "node scripts/review.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai-hero/sandcastle": "^0.12.0"
+    "@ai-hero/sandcastle": "^0.12.0",
+    "zod": "^4.1.13"
   },
   "devDependencies": {
-    "@standard-schema/spec": "^1.1.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
   }

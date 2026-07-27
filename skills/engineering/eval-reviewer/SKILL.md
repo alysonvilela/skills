@@ -1,57 +1,45 @@
 ---
 name: eval-reviewer
-description: Use when you want an adversarial code review from multiple independent angles at once. Six personas (skeptic, architect, minimalist, security, performance, test-coverage) each review in their own sandbox with no visibility into each other's findings, then a deterministic merge step dedupes and ranks them into one report with a PASS/CONTESTED/REJECT/INCOMPLETE verdict. Runs from any agent CLI or from GitHub Actions. Use when the user says "review this", "evaluate this code", asks for a second opinion on a diff or PR, or runs the CLI directly.
+description: Use when you want an adversarial code review from multiple independent angles at once. Six personas (skeptic, architect, minimalist, security, performance, test-coverage) each review the same target with no visibility into each other's findings, then a deterministic merge dedupes and ranks them into one report with a PASS/CONTESTED/REJECT/INCOMPLETE verdict. Runs on the agent CLI you already have open, in Docker, or in CI. Use when the user says "review this", "evaluate this code", asks for a second opinion on a diff or PR, or runs the CLI directly.
 license: MIT
 ---
 
 # Eval Reviewer
 
-Six personas review the same diff independently and simultaneously — no persona sees another's findings before writing its own, so nothing anchors on anything else. Each runs in its own sandbox on its own git branch. The merge step that follows is plain code, not an LLM: same findings in, same verdict out, every time.
+Six personas review the same target independently and simultaneously — no persona sees another's findings before writing its own, so nothing anchors on anything else. The merge step that follows is plain code, not an LLM: same findings in, same verdict out, every time.
 
 ## The one rule
 
-Run the orchestrator and present what it produces — the sandboxed personas do the reviewing, you don't. If the tool misbehaves mid-task, report it as a bug; hand-editing `scripts/orchestrator.ts` to route around the problem hides the failure instead of surfacing it.
+Run it and present what it produces — the personas do the reviewing, you don't. If it misbehaves mid-task, report it as a bug; hand-editing `scripts/orchestrator.ts` to route around a problem hides the failure instead of surfacing it.
 
 ## Steps
 
-### 1 — Set the repo up, once
+### 1 — Get the target onto disk
 
-```bash
-node <skill>/scripts/setup.mjs
-```
-
-Installs the one dependency, symlinks the orchestrator into the target repo as `.sandcastle/eval-reviewer.ts`, and builds the sandbox image. Everything it does is idempotent, so re-running it is how you check the setup rather than a thing to avoid. Add `--workflow` for a GitHub Actions workflow, `--agent NAME` to review with something other than the agent whose credential is already exported.
-
-Its closing output names what is still missing — usually a credential. Read it and act on it.
-
-**Done when:** `.sandcastle/eval-reviewer.ts` resolves, and setup printed no remaining "First:" items.
-
-### 2 — Get the target onto disk
-
-The orchestrator takes a **file path**, literal text, or `--diff <base-ref>` — never a URL, and it fetches nothing itself.
+The runner takes a **file path**, literal text, or `--diff <base-ref>` — never a URL, and it fetches nothing itself.
 
 - Local branch: `--diff main` (it runs `git diff main...HEAD` for you)
 - GitHub PR: `gh pr diff <url> > /tmp/eval-review-target.md`
 - Existing file or codebase: pass the path
 
-The target's full text is embedded in each persona's prompt, so the review covers it even though the sandbox worktree is branched from `HEAD` and won't contain uncommitted changes.
+The target's full text is embedded in each persona's prompt, so the review covers it even though each persona works in a worktree branched from `HEAD` that won't contain uncommitted changes.
 
-**Done when:** you have a path, or a base ref — not a summary of the change.
+**Done when:** you have a path or a base ref — not a summary of the change.
 
-### 3 — Run it
+### 2 — Run it
 
 ```bash
-node .sandcastle/eval-reviewer.ts --diff main
-node .sandcastle/eval-reviewer.ts /tmp/eval-review-target.md --personas skeptic,security
+bun <skill>/scripts/review.ts --diff main
+bun <skill>/scripts/review.ts /tmp/eval-review-target.md --personas skeptic,security
 ```
 
-`bun` and `npx tsx` run it equally well; use whichever the repo already uses. Everything tunable is an environment variable with a `--flag` twin — `node .sandcastle/eval-reviewer.ts --help` prints the full list. There is no config file.
+`node` (22.18+) and `npx tsx` work in place of `bun`. There is no setup step: the first run installs the skill's dependencies itself, and docker mode builds its image on first use.
 
-Personas run in batches of `--concurrency` (default 3), each a full agent run in its own sandbox. Budget the wait: six personas at concurrency 3 is two sequential batches.
+Personas run in batches of `execution.concurrency` (default 3), each a full agent run. Budget the wait: six personas at concurrency 3 is two sequential batches.
 
-**Done when:** the process has exited. Its exit code is the gate: `0`=clean, `1`=findings at or above `--fail-on`, `2`=critical findings, `3`=incomplete run.
+**Done when:** the process has exited. Its exit code is the gate: `0`=clean, `1`=findings at or above `review.failOn`, `2`=critical findings, `3`=incomplete run.
 
-### 4 — Read the output
+### 3 — Read the output
 
 Written into the reviewed repo: `.eval-reviewer/report.md` and `.eval-reviewer/verdict.json`, with per-persona transcripts at `.eval-reviewer/<persona>/agent.log`. The directory ignores itself, so it never shows up in `git status`.
 
@@ -59,36 +47,63 @@ If a persona failed, both files say so by name and carry the error — `report.m
 
 **Done when:** you've read both — the markdown is for the user, the JSON has the structured breakdown you need to reason about the verdict.
 
-### 5 — Present
+### 4 — Present
 
 Show the report to the user. If the verdict is `INCOMPLETE`, say which personas didn't finish *before* anything else — an `INCOMPLETE` that reads like a clean run is a different claim than one with full coverage, and whoever reads it needs to know which they're getting.
 
 ## Configuration
 
-Environment variables, each with a flag that overrides it. The defaults are chosen so that exporting one credential is enough.
+One file, `eval-reviewer.config.ts`. The runner reads the copy in the reviewed repo's root; without one it falls back to the skill's own, which is also the file to copy when a repo needs its own settings. Every field is optional.
 
-| Variable | Flag | Default |
-|---|---|---|
-| `EVAL_AGENT` | `--agent` | the first of claude-code, pi, codex, cursor, opencode, copilot whose credential is set |
-| `EVAL_MODEL` | `--model` | that agent's own default |
-| `EVAL_EFFORT` | `--effort` | `medium` |
-| `EVAL_SANDBOX` | `--sandbox` | `docker` locally, `none` when `CI` is set |
-| `EVAL_IMAGE` | `--image` | `sandcastle:eval-reviewer-<agent>` |
-| `EVAL_PERSONAS` | `--personas` | all six |
-| `EVAL_CONCURRENCY` | `--concurrency` | `3` |
-| `EVAL_IDLE_TIMEOUT` | `--timeout` | `600` seconds without agent output |
-| `EVAL_RETRIES` | `--retries` | `2` re-asks when a persona's output fails validation |
-| `EVAL_FAIL_ON` | `--fail-on` | `high` — the severity that makes the exit code non-zero |
-| `EVAL_OUT` | `--out` | `<repo>/.eval-reviewer` |
-| `EVAL_REPO` | `--repo` | git root above the working directory |
+```ts
+export default {
+  agent: {
+    provider: "pi",                          // pi | claude-code | codex
+    model: "lm-studio/gemma-4-e2b-it",       // pi resolves "provider/id"
+    thinking: "medium",
+  },
+  execution: { mode: "local", concurrency: 3, idleTimeoutSeconds: 600, retries: 2 },
+  docker: {
+    image: "sandcastle:eval-reviewer",
+    mounts: [{ hostPath: "~/.pi/agent", sandboxPath: "~/.pi/agent", readonly: true }],
+    forwardEnv: ["OPENAI_API_KEY"],
+  },
+  review: { personas: [...], failOn: "high", outDir: ".eval-reviewer" },
+};
+```
 
-Credentials are read from the shell first, then from `<repo>/.sandcastle/.env`. They are forwarded into the sandbox at launch and never written anywhere.
+Four flags override it for one run: `--mode`, `--personas`, `--fail-on`, `--config`. `--help` prints the list.
+
+## Credentials
+
+**There is no credential to export.** `mode: "local"` runs the agent CLI already installed on the machine and inherits the shell it was started from, so whatever authenticates your harness — an OAuth token on disk, `~/.pi/agent/models.json`, an exported key — authenticates the review. If the CLI is on PATH, the run proceeds.
+
+`mode: "docker"` is the exception: a container gets none of that, so it carries exactly what `docker.mounts` and `docker.forwardEnv` hand it. The default mounts pi's provider registry, which is what lets a sandboxed pi reach the same OpenAI-compatible endpoint the host pi does. A docker run with neither list populated fails at preflight rather than starting a container that cannot authenticate.
+
+Under CI the mode is forced to `local`: a runner is already a disposable VM, and its secrets are in the environment — exactly what local mode inherits.
+
+## OpenAI-compatible endpoints
+
+pi reaches any OpenAI-compatible endpoint through a provider entry in `~/.pi/agent/models.json`, where `apiKey` may be a `$VAR` reference rather than a literal key:
+
+```json
+{
+  "providers": {
+    "my-api": {
+      "baseUrl": "https://api.example.com/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENAI_API_KEY",
+      "models": [{ "id": "my-model" }]
+    }
+  }
+}
+```
+
+Then `agent.model: "my-api/my-model"`. Local mode needs nothing else. Docker mode also needs `~/.pi/agent` in `docker.mounts` and `OPENAI_API_KEY` in `docker.forwardEnv`.
 
 ## CI
 
-`scripts/setup.mjs --workflow` writes `.github/workflows/eval-review.yml`: it installs the skill on the runner, runs the six personas against `git diff <base>...HEAD`, puts the report in the job summary, uploads `.eval-reviewer/` as an artifact, and fails the job at `EVAL_FAIL_ON`. Add the credential as a repository secret under the name the workflow's `env:` block references.
-
-The workflow sets `EVAL_SANDBOX=none`: an Actions runner is already a disposable VM, so a container inside it would only add an image build to every run. On a developer's own machine the container is the boundary, and `docker` stays the default.
+Copy `workflows/eval-review.yml` to `.github/workflows/`. It reviews `git diff <base>...HEAD`, puts the report in the job summary, uploads `.eval-reviewer/` as an artifact, and fails the job at `review.failOn`. Its comments name the two things to set: the agent CLI to install, and the secret to export.
 
 ## Personas (prompts in `references/`)
 
@@ -101,7 +116,7 @@ The workflow sets `EVAL_SANDBOX=none`: an Actions runner is already a disposable
 | **Performance** | Bottlenecks, efficiency | Blocking calls, N+1 queries, memory leaks, thread misuse |
 | **Test Coverage** | Scenario completeness | Missing edge cases, weak assertions, untested error paths |
 
-★ marks a persona the review can't be trusted without. Adding a persona is a `references/<name>.md` prompt plus one line in the `PERSONAS` list at the top of `scripts/orchestrator.ts`.
+★ marks a persona the review can't be trusted without. Adding one is a `references/<name>.md` prompt plus one line in `review.personas`.
 
 ## Report
 
@@ -116,9 +131,9 @@ The workflow sets `EVAL_SANDBOX=none`: an Actions runner is already a disposable
     "skeptic": { "status": "done", "critical": true, "findings": 2, "verdict": "contest" }
   },
   "target": "git diff main...HEAD",
-  "agent": "claude-code",
-  "model": "claude-sonnet-4-6",
-  "sandbox": "docker",
+  "agent": "pi",
+  "model": "lm-studio/gemma-4-e2b-it",
+  "mode": "local",
   "timestamp": "..."
 }
 ```

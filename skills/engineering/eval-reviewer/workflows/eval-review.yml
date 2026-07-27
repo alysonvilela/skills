@@ -1,9 +1,13 @@
-# Six personas review the pull request independently, then a deterministic
-# merge step compiles one report into the job summary.
+# Every persona reviews the pull request independently, then a deterministic
+# merge compiles one report into the job summary.
 #
-# Written by `scripts/setup.mjs --workflow`. Before this runs, add the
-# credential as a repository secret: Settings → Secrets and variables →
-# Actions → New repository secret, named {{CREDENTIAL}}.
+# Copy this file to .github/workflows/eval-review.yml in the repo you want
+# reviewed. It runs in local mode — an Actions runner is already a disposable
+# VM, so a container inside it would only add an image build to every run — and
+# takes its credentials from the environment, which is where CI keeps them.
+#
+# Before the first run, add the secrets and variables the steps below
+# reference: Settings → Secrets and variables → Actions.
 name: eval-review
 
 on:
@@ -35,32 +39,48 @@ jobs:
         with:
           node-version: 24
 
-      # The agent runs directly on the runner: an Actions VM is already a
-      # disposable sandbox, so a container inside it would only add an image
-      # build to every run.
-      - name: Install the {{AGENT}} CLI
-        run: npm install -g {{AGENT_NPM_PACKAGE}}
+      # Whichever CLI eval-reviewer.config.ts names in agent.provider:
+      #   pi          → @earendil-works/pi-coding-agent
+      #   claude-code → @anthropic-ai/claude-code
+      #   codex       → @openai/codex
+      - name: Install the agent CLI
+        run: npm install -g @earendil-works/pi-coding-agent
+
+      # pi resolves "provider/model" against its own registry, which does not
+      # exist on a fresh runner. This recreates the one entry the review needs.
+      # The key stays a $VAR reference, so it is never written to disk.
+      # Delete this step for claude-code or codex.
+      - name: Point pi at the review endpoint
+        env:
+          BASE_URL: ${{ vars.EVAL_BASE_URL }}
+          MODEL_ID: ${{ vars.EVAL_MODEL_ID }}
+        run: |
+          mkdir -p ~/.pi/agent
+          cat > ~/.pi/agent/models.json <<JSON
+          {
+            "providers": {
+              "review": {
+                "baseUrl": "$BASE_URL",
+                "api": "openai-completions",
+                "apiKey": "\$OPENAI_API_KEY",
+                "models": [{ "id": "$MODEL_ID" }]
+              }
+            }
+          }
+          JSON
 
       - name: Install eval-reviewer
-        run: |
-          git clone --depth 1 https://github.com/alysonvilela/skills.git "$RUNNER_TEMP/skills"
-          npm install --omit=dev --no-fund --no-audit \
-            --prefix "$RUNNER_TEMP/skills/skills/engineering/eval-reviewer"
+        run: git clone --depth 1 https://github.com/alysonvilela/skills.git "$RUNNER_TEMP/skills"
 
+      # The runner exports the credential and local mode inherits this shell,
+      # so nothing else has to be wired up. The repo's eval-reviewer.config.ts
+      # decides the agent, the model, the personas, and the gate — set
+      # agent.model to "review/<EVAL_MODEL_ID>" to match the step above.
       - name: Review
         env:
-          {{CREDENTIAL}}: ${{ secrets.{{CREDENTIAL}} }}
-          EVAL_AGENT: {{AGENT}}
-          EVAL_SANDBOX: none
-          # Every persona is a full agent run. Trim the roster or lower the
-          # concurrency to trade coverage for cost and runner memory.
-          EVAL_PERSONAS: skeptic,architect,security,minimalist,performance,test-coverage
-          EVAL_CONCURRENCY: 3
-          # critical | high | medium | low | never — the severity that fails
-          # the job. `never` still reports, and still fails on an incomplete run.
-          EVAL_FAIL_ON: high
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          node "$RUNNER_TEMP/skills/skills/engineering/eval-reviewer/scripts/orchestrator.ts" \
+          node "$RUNNER_TEMP/skills/skills/engineering/eval-reviewer/scripts/review.ts" \
             --repo "$GITHUB_WORKSPACE" \
             --diff "origin/${{ github.base_ref || github.event.repository.default_branch }}"
 
