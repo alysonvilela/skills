@@ -1,112 +1,103 @@
 ---
 name: akita
-description: >-
-  Code/plan reviewer inspirado nos princípios de Fabio Akita — múltiplos
-  revisores, produção-primeiro, comece pelo desejo não pela arquitetura.
-  Dispara sub-agentes com matriz de personalidades, consolida achados e
-  entrega: (1) o mínimo necessário AGORA, (2) observação sobre evolução futura.
+description: Use when reviewing a GitHub PR or a plan file and the question is production-readiness, not just correctness. Dispatches five independent personas — skeptic, architect, minimalist, security, production engineer — in parallel, then a consolidator merges findings into a minimum-now vs. evolve-later verdict, inspired by Fabio Akita's writing. Use when the user says "review this PR", "review this plan", or asks whether something is ready to ship.
+license: MIT
 ---
 
-# Akita — Revisor Multi-Agente com Matriz de Personalidades
+# Akita — Multi-Agent Reviewer with a Persona Matrix
 
-Revisor de código e planos inspirado nos princípios de **Fabio Akita**:
-múltiplos revisores pegam coisas diferentes, "it works" é só 25% do esforço,
-comece pelo desejo não pela arquitetura, e toda decisão deve ter o mínimo
-necessário primeiro com uma observação de evolução.
-
-## Quando Usar
-
-- "Review this PR: <link>"
-- "Review this plan: <file>"
-- "Revisa esse código pra mim"
-- "Analisa esse plano e sugere melhorias"
-- "Olha esse PR e diz o que precisa melhorar"
-
-## Como Funciona
+Inspired by Fabio Akita's principles: **multiple reviewers catch different things** — Claude Code and Codex, reviewing the same PR, each found different holes. **"It works" is only 25% of the effort**; the rest is hardening. And every consolidated finding has two parts that must not be conflated: the minimum needed to not break **now**, and an observation about how this **evolves later**.
 
 ```
-Usuário → LINK do PR ou arquivo de plano
-                    │
-                    ▼
-      ┌─────────────────────────┐
-      │     Akita Boss          │  ← Consolidador (Akita skills)
-      │  (orquestrador + merge) │
-      └────────┬────┬────┬──────┘
-               │    │    │
-       ┌───────┘    │    └────────┐
-       ▼            ▼             ▼
-┌──────────┐ ┌──────────┐ ┌──────────────┐
-│ Cético   │ │Arquiteto │ │ Minimalista  │
-├──────────┤ ├──────────┤ ├──────────────┤
-│Segurança │ │ Produção │ │ (planos tbm  │
-│          │ │          │ │  tem visão   │
-│          │ │          │ │  de produto) │
-└──────────┘ └──────────┘ └──────────────┘
-       │            │             │
-       └────────────┼─────────────┘
-                    ▼
-      ┌─────────────────────────┐
-      │    Consolidador Akita   │
-      │   (merge + prioriza +   │
-      │    minimal fix now +    │
-      │    future evolution)    │
-      └─────────────────────────┘
-                    │
-                    ▼
-         Relatório final estruturado
+PR or plan
+     │
+     ▼
+┌─────────────┐     ┌──────────┐ ┌──────────┐ ┌─────────────┐
+│ Orchestrator│ ──▶ │ Skeptic  │ │Architect │ │ Minimalist  │  (parallel)
+│  (you)      │     └──────────┘ └──────────┘ └─────────────┘
+└─────────────┘     ┌──────────┐ ┌─────────────┐
+                     │ Security │ │Production Eng│
+                     └──────────┘ └─────────────┘
+                            │
+                            ▼
+                      Consolidator
+                            │
+                            ▼
+                  Final report + verdict
 ```
 
-## Arquitetura
+## The one rule
 
-1. **Orquestrador (você, o agente principal)**:
-   - Recebe o input do usuário (link do PR ou path do plano)
-   - Baixa o diff do PR (via `gh pr diff` ou web fetch) ou lê o arquivo de plano
-   - Dispara sub-agentes em PARALELO com `task(run_in_background=true)`
-   - Aguarda todos completarem
-   - Invoca o **Consolidador Akita** com todos os resultados
+You orchestrate and consolidate. You do not review — that's the personas' job — and you do not edit: this is a review tool, full stop. If you catch yourself wanting to fix something you're reading, that observation becomes a finding in the report, not a change to the diff.
 
-2. **Sub-agentes da Matriz de Personalidades** (rodam em paralelo):
-   - **Cético** — "Prove que funciona" — bugs, edge cases, error handling
-   - **Minimalista** — "Comece pelo desejo" — over-engineering, simplicidade
-   - **Arquiteto** — "Decisões estruturais" — acoplamento, boundaries
-   - **Segurança** — "Todo input é hostil" — vulnerabilidades, dados
-   - **Engenheiro de Produção** — "75% é hardening" — tests, deploy, observabilidade
+## Steps
 
-3. **Consolidador Akita (boss)**:
-   - Recebe TODOS os findings dos sub-agentes
-   - Deduplica, ranqueia por severidade
-   - Aplica o lens Akita de produção
-   - Para cada finding: (a) o mínimo necessário AGORA, (b) observação de evolução futura
-   - Produz relatório final com veredito
+### 1 — Capture the input
 
-## Output
+**GitHub PR:** accept any link shape (`.../pull/123`, `.../pull/123/files`, `org/repo#123`) and extract org/repo/number. Fetch both the diff **and** the description — a persona that only sees the diff can't tell over-engineering from a legitimately larger ask:
+```bash
+gh pr view <url> --json title,body,additions,deletions,files
+gh pr diff <url>
+```
+No `gh` available: web-fetch the PR URL with `.diff` appended.
 
-Relatório estruturado em seções:
+**Plan file:** read it in full.
+
+**Done when:** you hold the complete diff/plan — not a summary of it. A persona working from a description of the code finds different bugs than one reading the code itself.
+
+### 2 — Dispatch the persona matrix
+
+Fire all five personas — Skeptic, Architect, Minimalist, Security, Production Engineer — as background `oracle` subagents, in parallel. Each one's prompt is the content of `references/{persona}.md` plus the full input from step 1.
+
+**Done when:** you hold five task IDs. Four dispatched and "essentially the matrix" is not the matrix — a persona that never ran is a blind spot nobody knows exists.
+
+### 3 — Collect every result
+
+Wait on each task ID; pull results with `background_output(task_id=...)`.
+
+**Done when:** each of the five has either returned findings or hit its timeout. A persona that times out is not dropped — mark it `timed_out` and carry that into the report. Letting a slow persona silently fall out of the merge is how a REJECT-worthy finding disappears.
+
+### 4 — Consolidate
+
+Invoke the Consolidator (`references/consolidator.md`) as a sixth, synchronous `oracle` call, with every persona's findings attached — including any `timed_out` markers.
+
+**Done when:** you have a verdict (PASS / CONTESTED / REJECT) and the full structured findings back.
+
+### 5 — Present
+
+Show the consolidated report to the user in the format under Report.
+
+## Personas (references in `references/`)
+
+| Persona | Focus | Catches |
+|---|---|---|
+| **Skeptic** | Correctness, completeness | Bugs, race conditions, unhandled errors |
+| **Architect** | Structural fitness | Coupling, boundary violations, responsibility leaks |
+| **Minimalist** | Necessity, simplicity | Over-engineering, premature abstraction |
+| **Security** | Safety boundaries | Data exposure, injection, secrets |
+| **Production Eng.** | Production readiness | Tests, deploy, observability, cost |
+
+## Report
 
 ```
-## Veredito: PASS | CONTESTED | REJECT
+## Akita Review Report
+**Type:** PR | Plan
+**Target:** <link or file>
+**Final Verdict:** PASS | CONTESTED | REJECT
 
-## Achados por severidade
-### 🔴 Crítico (deve ser resolvido AGORA)
-### 🟡 Médio (resolver idealmente agora)
-### 🟢 Leve (observação)
+### Executive Summary
+- X critical, Y high, Z medium, W low
+- Production readiness: N/M items
+- Personas: 5/5 complete (or: N/5 — name who timed out)
 
-## Produção Readiness (Akita Checklist)
-[ ] Test coverage
-[ ] Security audit
-[ ] Observability
-[ ] etc.
+### Detailed Findings
+[by severity, each with: the problem, minimum needed NOW, future-evolution note]
 
-## Observações de Evolução Futura
-Coisas que não precisam ser feitas agora, mas vale deixar registrado.
+### Production Readiness Checklist
+[based on the Production Engineer's checklist]
+
+### Future Evolution Notes
+[things that don't need to happen now, but are worth recording]
 ```
 
-## Personas (referências em `references/`)
-
-| Persona | Foco | Pega |
-|---------|------|------|
-| **Cético** | Corretude, completude | Bugs, race conditions, erros não tratados |
-| **Minimalista** | Necessidade, simplicidade | Over-engineering, abstração prematura |
-| **Arquiteto** | Fitness estrutural | Acoplamento, boundaries, vazamento de responsabilidade |
-| **Segurança** | Safety boundaries | Exposição de dados, injeção, secrets |
-| **Eng. Produção** | Production readiness | Testes, deploy, observabilidade, custos |
+If any persona timed out, say so before the verdict, not after — a REJECT that's actually "4 of 5 opinions, Security never responded" is different information from a REJECT with full coverage, and whoever reads the report needs to know which one they're getting.
