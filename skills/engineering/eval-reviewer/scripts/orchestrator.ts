@@ -586,6 +586,49 @@ function personaPrompt(persona: string): string {
   return join(SKILL_ROOT, "references", `${persona}.md`);
 }
 
+/**
+ * The agent's own explanation of why it said nothing, dug out of one raw stdout
+ * line.
+ *
+ * An agent CLI that cannot reach its provider does not crash: it reports the
+ * failure inside its event stream and exits 0. Sandcastle's parser has no
+ * reason to surface that — it is looking for assistant text — so without this
+ * the run fails with "tag not found" and the real message ("OAuth refresh
+ * failed", "model not found", "rate limited") never leaves the stream.
+ */
+function agentErrorIn(line: string): string | undefined {
+  const trimmed = line.trim();
+  if (!trimmed) return undefined;
+
+  if (!trimmed.startsWith("{")) {
+    return /^(error|fatal)\b/i.test(trimmed) ? trimmed : undefined;
+  }
+
+  let found: string | undefined;
+  const walk = (node: unknown): void => {
+    if (found || node === null || typeof node !== "object") return;
+    for (const [key, value] of Object.entries(node)) {
+      if (found) return;
+      if (
+        typeof value === "string" &&
+        value !== "" &&
+        /^(errorMessage|error|error_message)$/.test(key)
+      ) {
+        found = value;
+        return;
+      }
+      walk(value);
+    }
+  };
+
+  try {
+    walk(JSON.parse(trimmed));
+  } catch {
+    return undefined;
+  }
+  return found;
+}
+
 interface AgentResult {
   persona: string;
   status: "done" | "failed";
@@ -611,6 +654,7 @@ async function reviewWith(
   const logPath = join(outDir, persona.name, "agent.log");
   mkdirSync(dirname(logPath), { recursive: true });
   let spoke = false;
+  let agentError: string | undefined;
 
   try {
     const result = await sandcastle.run({
@@ -637,12 +681,16 @@ async function reviewWith(
       logging: {
         type: "file",
         path: logPath,
-        // Did the CLI say anything at all? A run that fails having emitted
-        // nothing is a broken CLI, not a model that ignored the format — and
-        // reporting the second when it was the first sends everyone hunting
-        // through prompts for a bug that was on PATH.
-        onAgentStreamEvent: () => {
-          spoke = true;
+        // Did the agent produce any text or tool call? A run that fails having
+        // produced none is a broken CLI or a model that returned nothing — not
+        // a model that ignored the output format — and reporting the second
+        // when it was the first sends everyone hunting through prompts for a
+        // bug that was on PATH. "raw" is excluded on purpose: session and
+        // lifecycle lines arrive even when the model never answers.
+        onAgentStreamEvent: (event) => {
+          if (event.type === "text" || event.type === "toolCall") spoke = true;
+          else if (event.type === "raw" && !agentError)
+            agentError = agentErrorIn(event.line);
         },
       },
       output: sandcastle.Output.object({
@@ -666,12 +714,14 @@ async function reviewWith(
       ? error instanceof Error
         ? error.message
         : String(error)
-      : `${runtime.cliPath ?? runtime.agentName} produced no output at all — ` +
-        `the review never ran. Check that this is the CLI you think it is ` +
-        `(\`${runtime.agentName === "pi" ? "pi" : runtime.agentName} --version\`), ` +
-        `that its model is reachable, and that it starts without errors on stderr. ` +
-        `A second, older copy of the CLI earlier on PATH fails exactly this way. ` +
-        `Full transcript: ${logPath}`;
+      : agentError
+        ? `the agent produced no text at all. It reported: ${agentError}`
+        : `the agent produced no text at all — the review never happened, so the ` +
+          `missing <${OUTPUT_TAG}> tag is a symptom, not the cause. Either ` +
+          `${runtime.cliPath ?? runtime.agentName} is not the CLI you think it is ` +
+          `(a second, older copy earlier on PATH exits 0 having printed nothing), ` +
+          `or "${config.agent.model}" returned an empty answer. ` +
+          `Full transcript: ${logPath}`;
     console.log(`  ✗ ${persona.name} — failed: ${message}`);
     return {
       persona: persona.name,
