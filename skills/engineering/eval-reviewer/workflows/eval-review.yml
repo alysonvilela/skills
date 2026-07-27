@@ -21,6 +21,8 @@ concurrency:
 
 permissions:
   contents: read
+  # The review is posted with the job's own GITHUB_TOKEN.
+  pull-requests: write
 
 jobs:
   review:
@@ -72,6 +74,19 @@ jobs:
       - name: Install eval-reviewer
         run: git clone --depth 1 https://github.com/alysonvilela/skills.git "$RUNNER_TEMP/skills"
 
+      # The diff is written to a file so the review and the PR comment anchor
+      # against the same bytes. Regenerating it between the two steps is how a
+      # comment ends up pointing at a line that moved.
+      #
+      # Add pathspec exclusions for anything generated — a build output
+      # directory is most of the diff and none of the review:
+      #   ':(exclude)**/dist/**' ':(exclude)**/.output/**'
+      - name: Build the review target
+        run: |
+          git diff "origin/${{ github.base_ref || github.event.repository.default_branch }}...HEAD" \
+            > "$RUNNER_TEMP/target.diff"
+          wc -l < "$RUNNER_TEMP/target.diff"
+
       # The runner exports the credential and local mode inherits this shell,
       # so nothing else has to be wired up. The repo's eval-reviewer.config.ts
       # decides the agent, the model, the personas, and the gate — set
@@ -82,7 +97,24 @@ jobs:
         run: |
           node "$RUNNER_TEMP/skills/skills/engineering/eval-reviewer/scripts/review.ts" \
             --repo "$GITHUB_WORKSPACE" \
-            --diff "origin/${{ github.base_ref || github.event.repository.default_branch }}"
+            "$RUNNER_TEMP/target.diff"
+
+      # Findings that name a line inside the diff become inline comments; the
+      # rest go in the review body. Anchors are validated first — GitHub rejects
+      # the whole review with 422 if one comment points outside the diff, so a
+      # single bad line number would cost every finding.
+      #
+      # `always()` because the review step exits non-zero at review.failOn, and
+      # a gate that blocks its own explanation is not much of a gate.
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node "$RUNNER_TEMP/skills/skills/engineering/eval-reviewer/scripts/pr-comment.ts" \
+            --verdict "$GITHUB_WORKSPACE/.eval-reviewer/verdict.json" \
+            --diff "$RUNNER_TEMP/target.diff" \
+            --pr "${{ github.event.number }}"
 
       # The report is on the run's summary page either way; this keeps the
       # per-persona transcripts around for when a persona misbehaves.
@@ -94,11 +126,14 @@ jobs:
           path: .eval-reviewer/
           retention-days: 14
 
-      # To post the report as a PR comment instead of a job summary, add
-      # `pull-requests: write` to permissions above and uncomment:
+      # For one plain comment carrying the whole report instead of an anchored
+      # review, drop the step above and use:
       #
-      # - name: Comment on the pull request
-      #   if: always() && github.event_name == 'pull_request'
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #   run: gh pr comment "${{ github.event.number }}" --body-file .eval-reviewer/report.md
+      #   gh pr comment "${{ github.event.number }}" \
+      #     --body-file .eval-reviewer/report.md
+      #
+      # Any other sink is the same shape — verdict.json carries the findings,
+      # so nothing downstream has to parse the markdown:
+      #
+      #   curl -X POST "$WEBHOOK" -d @.eval-reviewer/verdict.json
+      #   jq -e '.breakdown.critical == 0' .eval-reviewer/verdict.json

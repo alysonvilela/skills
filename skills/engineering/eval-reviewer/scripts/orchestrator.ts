@@ -793,6 +793,16 @@ interface Verdict {
       error?: string;
     }
   >;
+  /**
+   * The merged, deduplicated, severity-ranked findings — the same list
+   * report.md renders, in the shape the personas emitted it.
+   *
+   * It lives here so anything downstream (a PR comment, a webhook, a gate)
+   * reads one JSON file instead of parsing prose out of the markdown. That is
+   * the whole extension mechanism: this skill writes two files and an exit
+   * code, and a sink is a shell line, not a plugin.
+   */
+  findings: Finding[];
   target: string;
   agent: string;
   model: string;
@@ -852,6 +862,7 @@ function buildVerdict(
         },
       ])
     ),
+    findings,
     ...meta,
     timestamp: new Date().toISOString(),
   };

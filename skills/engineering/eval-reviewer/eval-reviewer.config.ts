@@ -85,12 +85,21 @@ export default {
      * Host paths bind-mounted into each container. `~` expands on both sides.
      * A path that does not exist on the host is skipped with a warning.
      *
-     * The default carries pi's provider registry in, so a sandboxed pi reaches
-     * the same OpenAI-compatible endpoint your host pi does. Swap it for
+     * The default carries pi's credentials and provider registry in, so a
+     * sandboxed pi reaches the same endpoint your host pi does. Swap these for
      * ~/.claude or ~/.codex if you changed `agent.provider`.
+     *
+     * Note what is *not* mounted: the ~/.pi/agent directory itself. pi writes
+     * its session files under it at startup, so mounting the whole directory
+     * read-only kills the run before the first token ("ENOENT: mkdir
+     * .../sessions/..."), and mounting it read-write lets a review container
+     * write into your real config. Mounting the files it reads leaves the
+     * directory itself writable inside the container and empty when it exits.
      */
     mounts: [
-      { hostPath: "~/.pi/agent", sandboxPath: "~/.pi/agent", readonly: true },
+      { hostPath: "~/.pi/agent/auth.json", sandboxPath: "~/.pi/agent/auth.json", readonly: true },
+      { hostPath: "~/.pi/agent/models.json", sandboxPath: "~/.pi/agent/models.json", readonly: true },
+      { hostPath: "~/.pi/agent/extensions", sandboxPath: "~/.pi/agent/extensions", readonly: true },
     ],
 
     /**

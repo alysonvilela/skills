@@ -66,7 +66,7 @@ export default {
   execution: { mode: "local", concurrency: 6, idleTimeoutSeconds: 300, retries: 2 },
   docker: {
     image: "sandcastle:eval-reviewer",
-    mounts: [{ hostPath: "~/.pi/agent", sandboxPath: "~/.pi/agent", readonly: true }],
+    mounts: [{ hostPath: "~/.pi/agent/auth.json", sandboxPath: "~/.pi/agent/auth.json", readonly: true }, ...],
     forwardEnv: ["OPENAI_API_KEY"],
   },
   review: { personas: [...], failOn: "high", outDir: ".eval-reviewer" },
@@ -79,7 +79,7 @@ Four flags override it for one run: `--mode`, `--personas`, `--fail-on`, `--conf
 
 **There is no credential to export.** `mode: "local"` runs the agent CLI already installed on the machine and inherits the shell it was started from, so whatever authenticates your harness — an OAuth token on disk, `~/.pi/agent/models.json`, an exported key — authenticates the review. If the CLI is on PATH, the run proceeds.
 
-`mode: "docker"` is the exception: a container gets none of that, so it carries exactly what `docker.mounts` and `docker.forwardEnv` hand it. The default mounts pi's provider registry, which is what lets a sandboxed pi reach the same OpenAI-compatible endpoint the host pi does. A docker run with neither list populated fails at preflight rather than starting a container that cannot authenticate.
+`mode: "docker"` is the exception: a container gets none of that, so it carries exactly what `docker.mounts` and `docker.forwardEnv` hand it. The default mounts the *files* pi reads — `auth.json`, `models.json`, `extensions/` — and deliberately not the `~/.pi/agent` directory, which pi writes its sessions into. A docker run with neither list populated fails at preflight rather than starting a container that cannot authenticate.
 
 Under CI the mode is forced to `local`: a runner is already a disposable VM, and its secrets are in the environment — exactly what local mode inherits.
 

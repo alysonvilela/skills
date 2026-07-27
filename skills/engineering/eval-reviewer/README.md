@@ -99,7 +99,7 @@ Everything lives in `eval-reviewer.config.ts`. Copy [the skill's own](./eval-rev
 | `execution.idleTimeoutSeconds` | `300` | seconds without agent output before a persona is stuck |
 | `execution.retries` | `2` | re-asks when a persona's JSON fails validation |
 | `docker.image` | `sandcastle:eval-reviewer` | built on first docker-mode run |
-| `docker.mounts` | `~/.pi/agent` (read-only) | host paths the container sees |
+| `docker.mounts` | pi's `auth.json`, `models.json`, `extensions/` (read-only) | host paths the container sees |
 | `docker.forwardEnv` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | variable names copied into the container |
 | `review.personas` | all six | `name` **is** the prompt file `references/<name>.md` |
 | `review.failOn` | `high` | severity that makes the exit code non-zero (`never` to only report) |
@@ -132,7 +132,9 @@ pi reaches any OpenAI-compatible endpoint through a provider entry in `~/.pi/age
 }
 ```
 
-Point `agent.model` at `"my-api/my-model"` and local mode is done. Docker mode also needs `~/.pi/agent` in `docker.mounts` and `OPENAI_API_KEY` in `docker.forwardEnv` — the mount is what makes the sandboxed pi see the same provider definition the host pi does.
+Point `agent.model` at `"my-api/my-model"` and local mode is done. Docker mode also needs `OPENAI_API_KEY` in `docker.forwardEnv`; `models.json` is already in the default mounts, and that mount is what makes the sandboxed pi see the same provider definition the host pi does.
+
+Mount the *files* pi reads, not the `~/.pi/agent` directory. pi creates its session directory under it at startup, so a read-only mount of the whole directory kills the run before the first token (`ENOENT: mkdir .../sessions/...`) and a read-write one lets a review container write into your real config. With only the files mounted, the directory itself is container-local: writable, and gone when the container exits.
 
 Some OpenAI-compatible servers reject the `developer` role or `reasoning_effort`; set `compat.supportsDeveloperRole` / `compat.supportsReasoningEffort` to `false` on the provider when that happens.
 
@@ -191,7 +193,7 @@ For pi against a custom endpoint it also writes a one-provider `~/.pi/agent/mode
 ## Output
 
 - **`.eval-reviewer/report.md`** — the full report, and the GitHub job summary when running in Actions
-- **`.eval-reviewer/verdict.json`** — structured verdict with severity breakdown and per-persona status
+- **`.eval-reviewer/verdict.json`** — the verdict, the severity breakdown, per-persona status, and the merged findings
 - **`.eval-reviewer/<persona>/agent.log`** — that persona's full agent transcript
 
 Written into the reviewed repo, in a directory that ignores itself — nothing to add to the repo's `.gitignore`.
@@ -204,6 +206,15 @@ Written into the reviewed repo, in a directory that ignores itself — nothing t
     "skeptic": { "status": "done", "critical": true, "findings": 2, "verdict": "contest" },
     "performance": { "status": "failed", "critical": false, "findings": 0, "verdict": "contest", "error": "..." }
   },
+  "findings": [
+    {
+      "severity": "high",
+      "file": "src/math.js",
+      "line": 6,
+      "message": "Division by zero returns Infinity with no guard.",
+      "suggestion": "Throw a RangeError when b === 0."
+    }
+  ],
   "target": "git diff main...HEAD",
   "agent": "pi",
   "model": "lm-studio/gemma-4-e2b-it",
@@ -213,6 +224,26 @@ Written into the reviewed repo, in a directory that ignores itself — nothing t
 ```
 
 A `PASS` requires that every selected persona reported. A critical persona failing makes the run `INCOMPLETE`; any persona failing makes an otherwise-empty run `INCOMPLETE` too, because "nothing found" from a partial review is an unknown result, not a clean one. Findings stand on their own either way.
+
+### Sending it somewhere
+
+`verdict.json` carries the merged findings, so nothing downstream parses the markdown. That is the whole extension mechanism — this skill writes two files and an exit code, and a sink is a shell line:
+
+```bash
+curl -X POST "$WEBHOOK" -d @.eval-reviewer/verdict.json
+gh pr comment 42 --body-file .eval-reviewer/report.md
+jq -e '.breakdown.critical == 0' .eval-reviewer/verdict.json
+```
+
+One sink ships with the skill, because it has a failure mode worth handling in code:
+
+```bash
+node <skill>/scripts/pr-comment.ts --diff /tmp/target.diff --pr 42
+```
+
+It turns each finding that names a line **inside the diff** into an inline review comment, and puts the rest in the review body. The anchor check is the point: GitHub rejects the entire review with `422` if one comment points at a line the diff does not contain, so a single hallucinated line number would cost every finding. Without `--pr` it prints the payload and posts nothing.
+
+Pass it the same diff file the review ran against, not a regenerated one — that is what keeps the line numbers meaning the same thing.
 
 ## Requirements
 
