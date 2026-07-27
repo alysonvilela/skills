@@ -5,8 +5,7 @@
   "description": "Multi-agent parallel code review with 6 specialized personas",
   "type": "module",
   "scripts": {
-    "review": "node scripts/review.ts",
-    "typecheck": "tsc --noEmit"
+    "review": "node scripts/review.ts"
   },
   "dependencies": {
     "@ai-hero/sandcastle": "^0.12.0",

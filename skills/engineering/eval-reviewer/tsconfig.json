@@ -12,5 +12,5 @@
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true
   },
-  "include": ["scripts/**/*.ts", "eval-reviewer.config.ts"]
+  "include": ["scripts/**/*.ts"]
 }
