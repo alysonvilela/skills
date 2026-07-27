@@ -14,32 +14,31 @@ Run it and present what it produces — the personas do the reviewing, you don't
 
 ## Steps
 
-### 1 — Get the target onto disk
-
-The runner takes a **file path**, literal text, or `--diff <base-ref>` — never a URL, and it fetches nothing itself.
-
-- Local branch: `--diff main` (it runs `git diff main...HEAD` for you)
-- GitHub PR: `gh pr diff <url> > /tmp/eval-review-target.md`
-- Existing file or codebase: pass the path
-
-The target's full text is embedded in each persona's prompt, so the review covers it even though each persona works in a worktree branched from `HEAD` that won't contain uncommitted changes.
-
-**Done when:** you have a path or a base ref — not a summary of the change.
-
-### 2 — Run it
+### 1 — Run it
 
 ```bash
-bun <skill>/scripts/review.ts --diff main
-bun <skill>/scripts/review.ts /tmp/eval-review-target.md --personas skeptic,security
+bun <skill>/scripts/review.ts
 ```
 
-`node` (22.18+) and `npx tsx` work in place of `bun`. There is no setup step: the first run installs the skill's dependencies itself, and docker mode builds its image on first use.
+**Do not ask the user what to review.** With no arguments it reviews the work in progress — uncommitted changes, or, if the tree is clean, this branch against its base. That is what "review this" means mid-task, and the runner picks it without you.
 
-Personas run in batches of `execution.concurrency` (default 3), each a full agent run. Budget the wait: six personas at concurrency 3 is two sequential batches.
+Pass a target only when the user named one:
+
+| They said | You run |
+|---|---|
+| "review against main" | `--diff main` |
+| a GitHub PR | `gh pr diff <url> > /tmp/target.diff` then pass that path |
+| a specific file | pass the path |
+
+Never a URL — the runner fetches nothing itself.
+
+`node` (22.18+) and `npx tsx` work in place of `bun`. There is no setup step: the first run installs the skill's dependencies, and docker mode builds its image on first use.
+
+All six personas run at once, each a full agent run, so the wait is the slowest persona rather than the sum.
 
 **Done when:** the process has exited. Its exit code is the gate: `0`=clean, `1`=findings at or above `review.failOn`, `2`=critical findings, `3`=incomplete run.
 
-### 3 — Read the output
+### 2 — Read the output
 
 Written into the reviewed repo: `.eval-reviewer/report.md` and `.eval-reviewer/verdict.json`, with per-persona transcripts at `.eval-reviewer/<persona>/agent.log`. The directory ignores itself, so it never shows up in `git status`.
 
@@ -47,7 +46,7 @@ If a persona failed, both files say so by name and carry the error — `report.m
 
 **Done when:** you've read both — the markdown is for the user, the JSON has the structured breakdown you need to reason about the verdict.
 
-### 4 — Present
+### 3 — Present
 
 Show the report to the user. If the verdict is `INCOMPLETE`, say which personas didn't finish *before* anything else — an `INCOMPLETE` that reads like a clean run is a different claim than one with full coverage, and whoever reads it needs to know which they're getting.
 
@@ -62,7 +61,7 @@ export default {
     model: "lm-studio/gemma-4-e2b-it",       // pi resolves "provider/id"
     thinking: "medium",
   },
-  execution: { mode: "local", concurrency: 3, idleTimeoutSeconds: 600, retries: 2 },
+  execution: { mode: "local", concurrency: 6, idleTimeoutSeconds: 300, retries: 2 },
   docker: {
     image: "sandcastle:eval-reviewer",
     mounts: [{ hostPath: "~/.pi/agent", sandboxPath: "~/.pi/agent", readonly: true }],
@@ -116,7 +115,9 @@ Copy `workflows/eval-review.yml` to `.github/workflows/`. It reviews `git diff <
 | **Performance** | Bottlenecks, efficiency | Blocking calls, N+1 queries, memory leaks, thread misuse |
 | **Test Coverage** | Scenario completeness | Missing edge cases, weak assertions, untested error paths |
 
-★ marks a persona the review can't be trusted without. Adding one is a `references/<name>.md` prompt plus one line in `review.personas`.
+★ marks a persona the review can't be trusted without.
+
+**Each file in `references/` is the prompt, sent as written.** `{{TARGET}}` is where the reviewed code lands. Nothing wraps it, so changing what a persona looks for is an edit to that one file — and adding a persona is a new file plus one line in `review.personas`.
 
 ## Report
 

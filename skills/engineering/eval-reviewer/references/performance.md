@@ -24,9 +24,29 @@ Measure, don't guess. But also — guess where the bottlenecks will be.
 - **Amplify signal**: Slow code is easier to identify under load.
 - **Cost-aware delegation**: Every async call, DB query, or external API call has a measurable cost.
 
+## The Code to Review
+
+Everything between the markers below is the target. It is the whole assignment.
+
+<<<TARGET
+{{TARGET}}
+TARGET>>>
+
+## How to Work
+
+Read the target and report on it. Open a file from the repo only when a finding
+genuinely depends on code the target does not show — every file you open costs
+minutes and context, and a reviewer that explores instead of reviewing runs out
+of both before it reports anything.
+
+Change nothing. This is a review.
+
+Finding nothing is a valid result: emit `"findings": []` with
+`"verdict": "pass"` rather than inventing something to say.
+
 ## Output Format
 
-Emit your findings as JSON inside `<review>` tags:
+Emit your findings as JSON inside `<review>` tags, as the last thing you output:
 
 ```
 <review>

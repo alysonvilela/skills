@@ -29,6 +29,12 @@ export default {
      *
      * claude-code and codex take their own model ids ("claude-sonnet-4-6",
      * "gpt-5.4").
+     *
+     * Whatever you pick has to hold an instruction across a long output: every
+     * persona must end its answer with a <review> JSON block. Small local models
+     * and free-tier routes tend to drop the tag or invent fields, which surfaces
+     * as "tag not found" / "failed schema validation" — a model problem, not a
+     * prompt one.
      */
     model: "lm-studio/gemma-4-e2b-it",
 
@@ -53,11 +59,19 @@ export default {
      */
     mode: "local",
 
-    /** Personas alive at once. Each is a full agent run. */
-    concurrency: 3,
+    /**
+     * Personas alive at once. Each is a full agent run, so the default runs all
+     * six in one round — the wall time of the slowest persona, not of two
+     * rounds. Lower it if six model processes is too much for the machine.
+     */
+    concurrency: 6,
 
-    /** Seconds without agent output before that persona is declared stuck. */
-    idleTimeoutSeconds: 600,
+    /**
+     * Seconds without agent output before that persona is declared stuck. A
+     * persona that has said nothing for five minutes is not thinking, it is
+     * wedged — and every persona above it waits out the timeout.
+     */
+    idleTimeoutSeconds: 300,
 
     /** Re-asks when a persona's JSON fails validation (session is resumed). */
     retries: 2,
@@ -89,7 +103,9 @@ export default {
 
   review: {
     /**
-     * Each name maps to a prompt at references/<name>.md.
+     * Each name is the prompt file at references/<name>.md — that file is sent
+     * to the agent as written, with {{TARGET}} replaced by the reviewed code.
+     * Nothing wraps it, so editing the file is how you change a persona.
      *
      * `critical: true` means the review is not trustworthy without it — if one
      * of those fails, the verdict is INCOMPLETE regardless of what the others

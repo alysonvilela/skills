@@ -15,10 +15,10 @@ npx skills@latest add alysonvilela/skills --skill eval-reviewer
 Then, from the repo you want reviewed:
 
 ```bash
-bun <skill>/scripts/review.ts --diff main
+bun <skill>/scripts/review.ts
 ```
 
-That is the whole setup. The first run installs the skill's one-time dependencies; docker mode builds its image on first use.
+That is the whole setup, and the whole invocation. With no arguments it reviews the work in progress — uncommitted changes, or a clean tree's branch against its base. The first run installs the skill's one-time dependencies; docker mode builds its image on first use.
 
 ## Architecture
 
@@ -27,8 +27,8 @@ That is the whole setup. The first run installs the skill's one-time dependencie
 │                      Orchestrator                           │
 │                                                             │
 │  1. Read eval-reviewer.config.ts                            │
-│  2. Embed the target in each persona's prompt               │
-│  3. Run personas via Sandcastle (own worktree + branch)     │
+│  2. Substitute the target into each persona's prompt file   │
+│  3. Run every persona at once via Sandcastle                │
 │  4. Deduplicate, rank, and merge findings                   │
 │  5. Generate report.md + verdict.json                       │
 └──────────┬──────────────────────────────┬───────────────────┘
@@ -73,17 +73,17 @@ That is the whole setup. The first run installs the skill's one-time dependencie
 ★ = critical persona. If one fails, the verdict is INCOMPLETE.
 ```
 
-Personas run in batches of `execution.concurrency` (default 3) — each batch is fully awaited before the next starts, so six personas is two sequential rounds of full agent runs, not one instant fan-out of six.
+All six run at once by default (`execution.concurrency`), so the wait is the slowest persona, not the sum of six.
 
 ## How it works
 
 1. **Configure** — one file, `eval-reviewer.config.ts`. The repo's copy wins; without one the skill's own defaults apply.
-2. **Run** — [Sandcastle](https://github.com/ai-hero-dev/sandcastle) puts each persona on its own git branch in its own worktree, either on this machine or in a container.
+2. **Run** — [Sandcastle](https://github.com/ai-hero-dev/sandcastle) sends each persona's file to an agent as its prompt, on this machine or in a container.
 3. **Collect** — each persona emits its findings as JSON inside `<review>` tags. Sandcastle extracts and schema-validates it; a persona whose output fails validation is re-asked (`execution.retries`) by resuming its session, so it re-emits without redoing the review.
 4. **Merge** — findings are deduplicated, ranked by severity, and compiled into one report. Plain code, not an LLM call.
 5. **Verdict** — **PASS** (all clean, all personas reported), **CONTESTED** (high-severity findings), **REJECT** (critical findings), or **INCOMPLETE** (a persona failed).
 
-The target's full text is embedded literally in each prompt rather than passed through Sandcastle's placeholder or shell-expansion pipeline, so nothing inside the reviewed diff is ever interpreted as a command.
+The target arrives as a Sandcastle prompt argument, which is inert by contract: `` !`command` `` and `{{KEY}}` inside an argument's value are never expanded, so nothing in the reviewed diff is interpreted as anything but text.
 
 ## Configuration
 
@@ -95,13 +95,13 @@ Everything lives in `eval-reviewer.config.ts`. Copy [the skill's own](./eval-rev
 | `agent.model` | `lm-studio/gemma-4-e2b-it` | pi resolves `"provider/id"` against its own registry |
 | `agent.thinking` | `medium` | `off` … `xhigh` |
 | `execution.mode` | `local` | `local` (this machine) or `docker` (one container per persona) |
-| `execution.concurrency` | `3` | personas alive at once |
-| `execution.idleTimeoutSeconds` | `600` | seconds without agent output before a persona is stuck |
+| `execution.concurrency` | `6` | personas alive at once — the default is all of them |
+| `execution.idleTimeoutSeconds` | `300` | seconds without agent output before a persona is stuck |
 | `execution.retries` | `2` | re-asks when a persona's JSON fails validation |
 | `docker.image` | `sandcastle:eval-reviewer` | built on first docker-mode run |
 | `docker.mounts` | `~/.pi/agent` (read-only) | host paths the container sees |
 | `docker.forwardEnv` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | variable names copied into the container |
-| `review.personas` | all six | `name` maps to `references/<name>.md` |
+| `review.personas` | all six | `name` **is** the prompt file `references/<name>.md` |
 | `review.failOn` | `high` | severity that makes the exit code non-zero (`never` to only report) |
 | `review.outDir` | `.eval-reviewer` | where the report lands |
 
@@ -147,12 +147,15 @@ Some OpenAI-compatible servers reject the `developer` role or `reasoning_effort`
 | **Performance** | Bottlenecks, efficiency | Blocking calls, N+1 queries, memory leaks, thread misuse |
 | **Test Coverage** | Scenario completeness | Missing edge cases, weak assertions, untested error paths |
 
-Prompts are in [`references/`](./references). Adding a persona is a `references/<name>.md` file plus one line in `review.personas`.
+Each file in [`references/`](./references) is the prompt, sent to the agent as written — `{{TARGET}}` is where the reviewed code lands. Nothing wraps it, so a persona is changed by editing its file, and added by writing a new one plus a line in `review.personas`.
 
 ## Usage
 
 ```bash
-# Everything, against the current branch
+# The work in progress — no arguments, no decisions
+bun <skill>/scripts/review.ts
+
+# Against an explicit base
 bun <skill>/scripts/review.ts --diff main
 
 # A file, with a subset of personas
@@ -218,7 +221,7 @@ A `PASS` requires that every selected persona reported. A critical persona faili
 - **Docker**, only for `mode: "docker"`
 - **`gh`** only if you feed it a GitHub PR — the runner accepts a local path, inline text, or a git ref, and fetches nothing itself
 
-Each persona works in its own git worktree branched from `HEAD`, so uncommitted working-tree changes are invisible to it and nothing it writes reaches the tree you are working in. The review target is passed in the prompt, so it is covered either way. The persona prompts are reviewer-only by instruction.
+Personas run against the repo as it is — no worktree, no branch, no merge. That machinery exists to keep an agent's *commits* off your branch, and a reviewer makes none: the prompts are reviewer-only by instruction and the whole target is already in the prompt, so nothing is gained by paying for six checkouts of the repo.
 
 ## Publish
 

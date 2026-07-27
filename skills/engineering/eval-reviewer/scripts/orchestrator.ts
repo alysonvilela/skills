@@ -2,9 +2,10 @@
  * eval-reviewer — every persona reviews the same target independently, then a
  * deterministic merge compiles one report.
  *
- * Everything tunable lives in eval-reviewer.config.ts. This file owns the run:
- * load the config, assemble the prompts, drive Sandcastle, merge the findings.
- * The merge is plain code on purpose — same findings in, same verdict out.
+ * Everything tunable lives in eval-reviewer.config.ts, and every persona is the
+ * prompt file references/<name>.md. This file owns the run: load the config,
+ * resolve the target, drive Sandcastle, merge the findings. The merge is plain
+ * code on purpose — same findings in, same verdict out.
  *
  * Two ways to run a persona, chosen by `execution.mode`:
  *   local  — the agent CLI on this machine, inheriting this shell. Whatever
@@ -71,8 +72,8 @@ const AGENTS = {
           : { effort: thinking }),
         // Outside a container Sandcastle withholds --dangerously-skip-permissions,
         // which leaves a -p run unable to read or grep — a review that can see
-        // nothing. Each persona works in its own throwaway worktree and the
-        // prompts are reviewer-only, so the bypass is asked for explicitly.
+        // nothing. The prompts are reviewer-only, so the bypass is asked for
+        // explicitly rather than left to a permission prompt nobody can answer.
         permissionMode: "bypassPermissions",
       }),
   },
@@ -111,8 +112,8 @@ const ConfigSchema = z.object({
   execution: z
     .object({
       mode: z.enum(["local", "docker"]).default("local"),
-      concurrency: z.number().int().positive().default(3),
-      idleTimeoutSeconds: z.number().int().positive().default(600),
+      concurrency: z.number().int().positive().default(6),
+      idleTimeoutSeconds: z.number().int().positive().default(300),
       retries: z.number().int().nonnegative().default(2),
     })
     .prefault({}),
@@ -191,8 +192,10 @@ const TARGET_WARN_BYTES = 400_000;
 const USAGE = `eval-reviewer — every persona reviews the same target independently
 
 Usage:
-  review.ts <file-or-text>       review a diff file, a code file, or literal text
+  review.ts                      review the work in progress — uncommitted
+                                 changes, else this branch against its base
   review.ts --diff <base-ref>    review \`git diff <base-ref>...HEAD\`
+  review.ts <file-or-text>       review a diff file, a code file, or literal text
 
 Options:
   --config PATH    config file (default: <repo>/eval-reviewer.config.ts, else the skill's)
@@ -285,7 +288,7 @@ function resolveRepo(explicit: string | undefined): string {
     }).trim();
   } catch {
     return fail(
-      "not inside a git repository — each persona reviews in a worktree, so one is required.",
+      "not inside a git repository — Sandcastle anchors a run to one.",
       "Run from the repo you're reviewing, or pass --repo PATH."
     );
   }
@@ -323,6 +326,54 @@ async function loadConfig(
 }
 
 /** A file path, literal text, or a diff computed here. Never a URL — nothing is fetched. */
+function git(repoRoot: string, args: string[]): string {
+  try {
+    return execFileSync("git", args, {
+      cwd: repoRoot,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * No target given, so answer the question instead of asking it: review the work
+ * in progress. Uncommitted changes first — that is what "review this" means
+ * mid-task — then the branch against the base it forked from.
+ */
+function defaultTarget(repoRoot: string): { target: string; label: string } {
+  const working = git(repoRoot, ["diff", "HEAD"]);
+  if (working.trim() !== "") {
+    return { target: working, label: "git diff HEAD (uncommitted work)" };
+  }
+
+  const remoteHead = git(repoRoot, [
+    "symbolic-ref",
+    "--short",
+    "refs/remotes/origin/HEAD",
+  ]).trim();
+  const candidates = [remoteHead, "origin/main", "origin/master", "main", "master"];
+
+  for (const base of candidates) {
+    if (base === "") continue;
+    if (git(repoRoot, ["rev-parse", "--verify", "--quiet", base]).trim() === "")
+      continue;
+    const branch = git(repoRoot, ["diff", `${base}...HEAD`]);
+    if (branch.trim() !== "") {
+      return { target: branch, label: `git diff ${base}...HEAD` };
+    }
+  }
+
+  return fail(
+    "nothing to review: no uncommitted changes, and this branch does not differ from its base.",
+    "Pass a base ref with --diff <ref>, or a file path.",
+    USAGE
+  );
+}
+
 function resolveTarget(
   flags: Flags,
   repoRoot: string
@@ -347,10 +398,7 @@ function resolveTarget(
     return { target, label };
   }
 
-  if (flags._.length === 0) {
-    console.error(USAGE);
-    process.exit(1);
-  }
+  if (flags._.length === 0) return defaultTarget(repoRoot);
 
   const path = resolve(flags._[0]!);
   return existsSync(path)
@@ -375,12 +423,27 @@ function preflight(config: Config, mode: "local" | "docker"): Runtime {
   const agentName = config.agent.provider;
   const agent: AgentSpec = AGENTS[agentName];
 
+  // A persona is its prompt file. Both checks below fail here rather than
+  // halfway through an agent run that could not have produced a review.
   for (const persona of config.review.personas) {
-    const prompt = join(SKILL_ROOT, "references", `${persona.name}.md`);
-    if (!existsSync(prompt)) {
+    const path = personaPrompt(persona.name);
+    if (!existsSync(path)) {
       fail(
         `no prompt for persona "${persona.name}".`,
-        `Expected ${prompt} — every name in review.personas needs one.`
+        `Expected ${path} — every name in review.personas needs one.`
+      );
+    }
+    const text = readFileSync(path, "utf-8");
+    if (!text.includes("{{TARGET}}")) {
+      fail(
+        `${path} has no {{TARGET}} placeholder.`,
+        "That is where the reviewed code is substituted in; without it the persona reviews nothing."
+      );
+    }
+    if (!text.includes(`<${OUTPUT_TAG}>`)) {
+      fail(
+        `${path} never mentions <${OUTPUT_TAG}>.`,
+        "Sandcastle requires the prompt to contain the opening tag it extracts."
       );
     }
   }
@@ -504,38 +567,10 @@ function ensureImage(config: Config, agentName: AgentName): void {
 
 // ─── Review execution ────────────────────────────────────────────────────────
 
-/**
- * The target is embedded literally rather than passed through Sandcastle's
- * promptArgs/promptFile pipeline, so nothing inside the reviewed diff is ever
- * treated as a placeholder or a shell expression.
- */
-function assemblePrompt(persona: string, target: string): string {
-  const personaPrompt = readFileSync(
-    join(SKILL_ROOT, "references", `${persona}.md`),
-    "utf-8"
-  );
-
-  return `# Code Review Task — ${persona} Persona
-
-${personaPrompt}
-
----
-
-## Code to Review
-
-\`\`\`
-${target}
-\`\`\`
-
-## Instructions
-
-Review the code above through your ${persona} lens, then emit your findings as
-JSON inside <${OUTPUT_TAG}> tags, in the exact shape given in your Output Format
-section. Finding nothing is a valid result — emit \`"findings": []\` with
-\`"verdict": "pass"\`.
-
-This is a review. Report what you find; leave the code as you found it.
-`;
+/** A persona's prompt file. Absolute, because Sandcastle resolves promptFile
+ *  against process.cwd() rather than the `cwd` option. */
+function personaPrompt(persona: string): string {
+  return join(SKILL_ROOT, "references", `${persona}.md`);
 }
 
 interface AgentResult {
@@ -573,12 +608,17 @@ async function reviewWith(
       sandbox: runtime.sandbox(),
       cwd: repoRoot,
       name: persona.name,
-      prompt: assemblePrompt(persona.name, target),
+      // The persona file is the prompt — no wrapper, no preamble. Sandcastle
+      // substitutes {{TARGET}} on the host and treats an argument's contents as
+      // inert text, so a diff carrying !`cmd` or {{KEY}} is never expanded.
+      promptFile: personaPrompt(persona.name),
+      promptArgs: { TARGET: target },
       // Structured output requires a single iteration.
       maxIterations: 1,
-      // Its own branch, so concurrent personas never share a working directory
-      // and nothing a persona writes reaches the tree you are working in.
-      branchStrategy: { type: "branch", branch: `eval-review/${persona.name}` },
+      // No branchStrategy: a review reads, it never commits. The default for
+      // bind-mount and no-sandbox providers is `head`, which skips the worktree,
+      // the branch, and the merge — six worktrees of a large repo was most of
+      // the wall time, spent isolating writes that never happen.
       idleTimeoutSeconds: config.execution.idleTimeoutSeconds,
       logging: { type: "file", path: logPath },
       output: sandcastle.Output.object({
