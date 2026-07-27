@@ -26,12 +26,11 @@ Assume every input is hostile and every dependency is compromised.
 
 ## Output Format
 
-Write your findings to `done.json` in this directory:
+Emit your findings as JSON inside `<review>` tags:
 
-```json
+```
+<review>
 {
-  "persona": "security",
-  "status": "done",
   "findings": [
     {
       "severity": "critical|high|medium|low",
@@ -43,6 +42,7 @@ Write your findings to `done.json` in this directory:
   ],
   "verdict": "pass|contest|reject"
 }
+</review>
 ```
 
 Severity guide:

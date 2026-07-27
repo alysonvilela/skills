@@ -24,12 +24,11 @@ Attack the code from every angle. Assume nothing is proven. Find the cracks.
 
 ## Output Format
 
-Write your findings to `done.json` in this directory:
+Emit your findings as JSON inside `<review>` tags:
 
-```json
+```
+<review>
 {
-  "persona": "skeptic",
-  "status": "done",
   "findings": [
     {
       "severity": "high|medium|low",
@@ -41,6 +40,7 @@ Write your findings to `done.json` in this directory:
   ],
   "verdict": "pass|contest|reject"
 }
+</review>
 ```
 
 Severity guide:

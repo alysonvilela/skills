@@ -27,12 +27,11 @@ Tests must verify real behavior, not mock behavior. Mocks are a means to isolate
 
 ## Output Format
 
-Write your findings to `done.json` in this directory:
+Emit your findings as JSON inside `<review>` tags:
 
-```json
+```
+<review>
 {
-  "persona": "test-coverage",
-  "status": "done",
   "findings": [
     {
       "severity": "high|medium|low",
@@ -44,6 +43,7 @@ Write your findings to `done.json` in this directory:
   ],
   "verdict": "pass|contest|reject"
 }
+</review>
 ```
 
 Severity guide:

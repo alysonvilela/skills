@@ -26,12 +26,11 @@ Measure, don't guess. But also — guess where the bottlenecks will be.
 
 ## Output Format
 
-Write your findings to `done.json` in this directory:
+Emit your findings as JSON inside `<review>` tags:
 
-```json
+```
+<review>
 {
-  "persona": "performance",
-  "status": "done",
   "findings": [
     {
       "severity": "high|medium|low",
@@ -43,6 +42,7 @@ Write your findings to `done.json` in this directory:
   ],
   "verdict": "pass|contest|reject"
 }
+</review>
 ```
 
 Severity guide:

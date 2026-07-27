@@ -25,12 +25,11 @@ Look past bugs — focus on whether the design will hold up under real-world pre
 
 ## Output Format
 
-Write your findings to `done.json` in this directory:
+Emit your findings as JSON inside `<review>` tags:
 
-```json
+```
+<review>
 {
-  "persona": "architect",
-  "status": "done",
   "findings": [
     {
       "severity": "high|medium|low",
@@ -42,6 +41,7 @@ Write your findings to `done.json` in this directory:
   ],
   "verdict": "pass|contest|reject"
 }
+</review>
 ```
 
 Severity guide:

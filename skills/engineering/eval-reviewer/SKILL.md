@@ -1,54 +1,68 @@
 ---
 name: eval-reviewer
-description: Use when you want an adversarial code review from multiple independent angles at once. Six personas (skeptic, architect, minimalist, security, performance, test-coverage) each run in an isolated subprocess with no visibility into each other's findings, then a deterministic merge step dedupes and ranks them into one report with a PASS/CONTESTED/REJECT/INCOMPLETE verdict. Use when the user says "review this", "evaluate this code", asks for a second opinion on a diff or PR, or runs the CLI directly.
+description: Use when you want an adversarial code review from multiple independent angles at once. Six personas (skeptic, architect, minimalist, security, performance, test-coverage) each review in their own sandboxed container with no visibility into each other's findings, then a deterministic merge step dedupes and ranks them into one report with a PASS/CONTESTED/REJECT/INCOMPLETE verdict. Use when the user says "review this", "evaluate this code", asks for a second opinion on a diff or PR, or runs the CLI directly.
 license: MIT
 ---
 
 # Eval Reviewer
 
-Six personas review the same diff independently and simultaneously — no persona sees another's findings before writing its own, so nothing anchors on anything else. The merge step that follows is plain code, not an LLM: same findings in, same verdict out, every time.
+Six personas review the same diff independently and simultaneously — no persona sees another's findings before writing its own, so nothing anchors on anything else. Each runs in its own container on its own git branch. The merge step that follows is plain code, not an LLM: same findings in, same verdict out, every time.
 
 ## The one rule
 
-Run the orchestrator and present what it produces — the six subprocess personas do the reviewing, you don't. If the tool misbehaves mid-task, report it as a bug; hand-editing `scripts/orchestrator.ts` or `scripts/spawn-agent.ts` to route around the problem hides the failure instead of surfacing it.
+Run the orchestrator and present what it produces — the sandboxed personas do the reviewing, you don't. If the tool misbehaves mid-task, report it as a bug; hand-editing `scripts/orchestrator.ts` to route around the problem hides the failure instead of surfacing it.
 
 ## Steps
 
-### 1 — Get the target onto disk
+### 1 — Check the prerequisites
 
-The orchestrator takes a **file path** (or literal inline text passed as the argument) — never a URL, and it does not fetch anything itself.
+The orchestrator needs Docker running, the `pi` CLI installed, and the sandbox image built once per repo:
+
+```bash
+npx @ai-hero/sandcastle init   # builds the image, scaffolds .sandcastle/
+```
+
+**Done when:** `docker info` succeeds and the image named in `references/config.yaml` exists.
+
+### 2 — Get the target onto disk
+
+The orchestrator takes a **file path** (or literal inline text as the argument) — never a URL, and it does not fetch anything itself.
 
 - Local diff: `git diff main...HEAD > /tmp/eval-review-target.md`
 - GitHub PR: `gh pr diff <url> > /tmp/eval-review-target.md`
 - Existing file or codebase: pass the path directly
 
+The target's full text is embedded in each persona's prompt, so the review covers it even though the sandbox worktree is branched from `HEAD` and won't contain uncommitted changes.
+
 **Done when:** you have a path to the complete diff or code — not a summary of it.
 
-### 2 — Run the orchestrator
+### 3 — Run the orchestrator
 
 ```bash
-bun scripts/orchestrator.ts <target> [--personas a,b,c] [--timeout 300] [--strategy qwen]
+bun scripts/orchestrator.ts <target> [--personas a,b,c] [--config PATH] [--repo PATH]
 ```
 
-Defaults: all 6 personas, 300s timeout each, `qwen` CLI headless. `qwen` and `claude` are the two working strategies — `generic` is an unfinished stub that always writes an error result.
+Everything else — which agent, which model, which sandbox, credentials, concurrency, timeouts, and which personas are load-bearing — lives in `references/config.yaml`. Change behaviour there, not with flags.
 
-Personas launch in batches of 4 concurrent, and the orchestrator waits for each batch to fully exit before starting the next — with all 6 selected, that's two sequential batches, not one instant fan-out of six. Budget wait time accordingly.
+Each persona reviews in a git worktree, so the run needs a repo: `--repo` defaults to the git root above your working directory. Credentials reach the container through `agent.forwardEnv` in the config, which names environment variables to forward from your shell — a name listed there but unset aborts the run before any container starts.
 
-Both spawn strategies run the reviewer CLI in an auto-approve mode (`qwen --yolo`, `claude --dangerously-skip-permissions`). The persona prompt instructs "review only, never edit," but enforcement stops there — treat the target the way you'd treat one you were handing to an unsupervised agent, since nothing at the process level backs the instruction up.
+Personas run in batches of `review.maxConcurrent` (default 3), each in its own container on its own branch. Budget wait time accordingly: six personas at concurrency 3 is two sequential batches of full agent runs.
 
 **Done when:** the process has exited. Its exit code is the verdict: `0`=PASS, `1`=CONTESTED, `2`=REJECT, `3`=INCOMPLETE.
 
-### 3 — Read the output
+### 4 — Read the output
 
-Written inside **this skill's own directory**, not the target repo: `.eval-reviewer/report.md` and `.eval-reviewer/verdict.json`, sitting next to `scripts/`. If a persona timed out, `verdict.json`'s `agents` map shows which one and that its `status` isn't `"done"`.
+Written inside **this skill's own directory**, not the target repo: `.eval-reviewer/report.md` and `.eval-reviewer/verdict.json`, sitting next to `scripts/`. Per-persona agent logs are at `.eval-reviewer/<persona>/agent.log`.
+
+If a persona failed, both files say so by name and carry the error — `report.md` gets a "Personas That Did Not Report" section, and `verdict.json` puts the message on that persona's entry.
 
 **Done when:** you've read both — the markdown is for the user, the JSON has the structured breakdown you need to reason about the verdict.
 
-### 4 — Present
+### 5 — Present
 
 Show the report to the user. If the verdict is `INCOMPLETE`, say which personas didn't finish *before* anything else — an `INCOMPLETE` that reads like a clean `REJECT` is a different claim than one with full coverage, and whoever reads it needs to know which they're getting.
 
-## Personas (references in `references/`)
+## Personas (prompts in `references/`, roster in `references/config.yaml`)
 
 | Persona | Focus | Catches |
 |---|---|---|
@@ -59,18 +73,20 @@ Show the report to the user. If the verdict is `INCOMPLETE`, say which personas 
 | **Performance** | Bottlenecks, efficiency | Blocking calls, N+1 queries, memory leaks, thread misuse |
 | **Test Coverage** | Scenario completeness | Missing edge cases, weak assertions, untested error paths |
 
-`skeptic`, `architect`, and `security` are the critical personas — if any of those three time out, the verdict is forced to `INCOMPLETE` regardless of what the others found.
+Personas marked `critical: true` in the config — skeptic, architect, security by default — are the ones the review can't be trusted without. If any of them fails, the verdict is `INCOMPLETE` regardless of what the others found.
 
 ## Report
 
-`report.md`: a verdict line, a severity-count table, an agent-status table (persona / status / finding count / that persona's own verdict), then findings grouped and sorted by severity.
+`report.md`: a verdict line, a severity-count table, an agent-status table (persona / critical / status / finding count / that persona's own verdict), a failure section when any persona didn't report, then findings grouped and sorted by severity.
 
 `verdict.json`:
 ```json
 {
   "overall": "PASS|CONTESTED|REJECT|INCOMPLETE",
   "breakdown": { "critical": 0, "high": 0, "medium": 0, "low": 0 },
-  "agents": { "skeptic": { "status": "done", "findings": 2, "verdict": "contest" } },
+  "agents": {
+    "skeptic": { "status": "done", "critical": true, "findings": 2, "verdict": "contest" }
+  },
   "target": "...",
   "timestamp": "..."
 }

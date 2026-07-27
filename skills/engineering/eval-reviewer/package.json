@@ -1,17 +1,23 @@
 {
   "name": "eval-reviewer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Multi-agent parallel code review with 6 specialized personas",
   "type": "module",
   "scripts": {
     "review": "bun scripts/orchestrator.ts",
-    "review:quick": "bun scripts/orchestrator.ts --timeout 120",
-    "review:skeptic": "bun scripts/orchestrator.ts --personas skeptic",
     "review:core": "bun scripts/orchestrator.ts --personas skeptic,architect,minimalist",
-    "review:security": "bun scripts/orchestrator.ts --personas security"
+    "review:security": "bun scripts/orchestrator.ts --personas security",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-hero/sandcastle": "^0.12.0",
+    "yaml": "^2.8.0",
+    "zod": "^4.1.0"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@standard-schema/spec": "^1.1.0",
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
   }
 }

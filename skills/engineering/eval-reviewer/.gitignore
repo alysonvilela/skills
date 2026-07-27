@@ -1,0 +1,5 @@
+# Review outputs — regenerated on every run
+.eval-reviewer/
+
+# Sandcastle scaffolding: image config, worktrees, logs, and .env
+.sandcastle/
