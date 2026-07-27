@@ -33,7 +33,7 @@ Emit your findings as JSON inside `<review>` tags:
 {
   "findings": [
     {
-      "severity": "high|medium|low",
+      "severity": "critical|high|medium|low",
       "file": "relative/path/to/file",
       "line": 42,
       "message": "Clear description of the performance issue",
@@ -46,6 +46,7 @@ Emit your findings as JSON inside `<review>` tags:
 ```
 
 Severity guide:
+- **critical**: Unbounded growth or a blocked event loop — it degrades until it stops working
 - **high**: Will cause timeout, OOM, or unacceptable latency at scale
 - **medium**: Noticeable performance degradation under moderate load
 - **low**: Minor optimization opportunity

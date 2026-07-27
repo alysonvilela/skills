@@ -31,7 +31,7 @@ Emit your findings as JSON inside `<review>` tags:
 {
   "findings": [
     {
-      "severity": "high|medium|low",
+      "severity": "critical|high|medium|low",
       "file": "relative/path/to/file",
       "line": 42,
       "message": "Clear description of the issue",
@@ -44,6 +44,7 @@ Emit your findings as JSON inside `<review>` tags:
 ```
 
 Severity guide:
+- **critical**: Certain failure or data loss on a path this change will take
 - **high**: Will cause runtime failure, data corruption, or security issue
 - **medium**: Will cause incorrect behavior under specific conditions
 - **low**: Code smell, minor risk, or maintenance concern

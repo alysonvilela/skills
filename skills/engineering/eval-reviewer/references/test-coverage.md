@@ -34,7 +34,7 @@ Emit your findings as JSON inside `<review>` tags:
 {
   "findings": [
     {
-      "severity": "high|medium|low",
+      "severity": "critical|high|medium|low",
       "file": "relative/path/to/file",
       "line": 42,
       "message": "Clear description of the testing gap or anti-pattern",
@@ -47,6 +47,7 @@ Emit your findings as JSON inside `<review>` tags:
 ```
 
 Severity guide:
+- **critical**: A path that loses data or money when it breaks has no test at all
 - **high**: Critical paths untested, or tests provide false confidence
 - **medium**: Notable gaps in test coverage or weak assertions
 - **low**: Minor test improvements or style issues

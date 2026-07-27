@@ -32,7 +32,7 @@ Emit your findings as JSON inside `<review>` tags:
 {
   "findings": [
     {
-      "severity": "high|medium|low",
+      "severity": "critical|high|medium|low",
       "file": "relative/path/to/file",
       "line": 42,
       "message": "Clear description of what can be simplified or removed",
@@ -45,6 +45,7 @@ Emit your findings as JSON inside `<review>` tags:
 ```
 
 Severity guide:
+- **critical**: Duplicated or dead logic that will silently diverge from the path that is actually used
 - **high**: Significant unnecessary complexity that will cause maintenance burden
 - **medium**: Abstraction or code that serves no current purpose
 - **low**: Minor opportunity for simplification

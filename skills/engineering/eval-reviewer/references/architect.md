@@ -32,7 +32,7 @@ Emit your findings as JSON inside `<review>` tags:
 {
   "findings": [
     {
-      "severity": "high|medium|low",
+      "severity": "critical|high|medium|low",
       "file": "relative/path/to/file",
       "line": 42,
       "message": "Clear description of the structural issue",
@@ -45,6 +45,7 @@ Emit your findings as JSON inside `<review>` tags:
 ```
 
 Severity guide:
+- **critical**: Design cannot work as written, or locks in a boundary that is expensive to undo later
 - **high**: Design will fail or require rewrite at scale
 - **medium**: Design creates unnecessary friction or limits future options
 - **low**: Design could be cleaner but is acceptable

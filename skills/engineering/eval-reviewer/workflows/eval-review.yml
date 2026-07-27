@@ -1,0 +1,84 @@
+# Six personas review the pull request independently, then a deterministic
+# merge step compiles one report into the job summary.
+#
+# Written by `scripts/setup.mjs --workflow`. Before this runs, add the
+# credential as a repository secret: Settings → Secrets and variables →
+# Actions → New repository secret, named {{CREDENTIAL}}.
+name: eval-review
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# A stale review of an older push is worse than no review.
+concurrency:
+  group: eval-review-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # Pull requests from forks get no secrets, so the run could only fail.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Personas review `git diff <base>...HEAD`, which needs both sides.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      # The agent runs directly on the runner: an Actions VM is already a
+      # disposable sandbox, so a container inside it would only add an image
+      # build to every run.
+      - name: Install the {{AGENT}} CLI
+        run: npm install -g {{AGENT_NPM_PACKAGE}}
+
+      - name: Install eval-reviewer
+        run: |
+          git clone --depth 1 https://github.com/alysonvilela/skills.git "$RUNNER_TEMP/skills"
+          npm install --omit=dev --no-fund --no-audit \
+            --prefix "$RUNNER_TEMP/skills/skills/engineering/eval-reviewer"
+
+      - name: Review
+        env:
+          {{CREDENTIAL}}: ${{ secrets.{{CREDENTIAL}} }}
+          EVAL_AGENT: {{AGENT}}
+          EVAL_SANDBOX: none
+          # Every persona is a full agent run. Trim the roster or lower the
+          # concurrency to trade coverage for cost and runner memory.
+          EVAL_PERSONAS: skeptic,architect,security,minimalist,performance,test-coverage
+          EVAL_CONCURRENCY: 3
+          # critical | high | medium | low | never — the severity that fails
+          # the job. `never` still reports, and still fails on an incomplete run.
+          EVAL_FAIL_ON: high
+        run: |
+          node "$RUNNER_TEMP/skills/skills/engineering/eval-reviewer/scripts/orchestrator.ts" \
+            --repo "$GITHUB_WORKSPACE" \
+            --diff "origin/${{ github.base_ref || github.event.repository.default_branch }}"
+
+      # The report is on the run's summary page either way; this keeps the
+      # per-persona transcripts around for when a persona misbehaves.
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-review
+          path: .eval-reviewer/
+          retention-days: 14
+
+      # To post the report as a PR comment instead of a job summary, add
+      # `pull-requests: write` to permissions above and uncomment:
+      #
+      # - name: Comment on the pull request
+      #   if: always() && github.event_name == 'pull_request'
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: gh pr comment "${{ github.event.number }}" --body-file .eval-reviewer/report.md

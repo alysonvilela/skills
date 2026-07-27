@@ -1,5 +1,5 @@
+# The one dependency, installed once per machine by scripts/setup.mjs
+node_modules/
+
 # Review outputs — regenerated on every run
 .eval-reviewer/
-
-# Sandcastle scaffolding: image config, worktrees, logs, and .env
-.sandcastle/

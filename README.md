@@ -48,7 +48,8 @@ Five gates, in order. Each must pass before the next opens:
 | [`/diagnosing-bugs`](./skills/engineering/diagnosing-bugs/SKILL.md) | Something is broken and the cause is not obvious | **No red-capable repro, no theory.** |
 | [`/tdd`](./skills/engineering/tdd/SKILL.md) | Building anything you would otherwise have to eyeball | A test you have never seen fail is not a test. |
 | [`/code-review`](./skills/engineering/code-review/SKILL.md) | Reviewing a diff, a branch, a PR | Spec and Standards are different questions. Report them separately. |
-| [`/eval-reviewer`](./skills/engineering/eval-reviewer/SKILL.md) | Want adversarial review from multiple angles at once | Six personas review in parallel, independently — no anchoring on each other's findings. |
+| [`/eval-reviewer`](./skills/engineering/eval-reviewer/SKILL.md) | Want adversarial review from multiple angles at once, locally or in CI | Six personas review in parallel, independently — no anchoring on each other's findings. |
+| [`/setup-eval-reviewer`](./skills/engineering/setup-eval-reviewer/SKILL.md) | Adding `/eval-reviewer` to a repo that doesn't have it | One idempotent script writes the wiring. Re-run it to check it. |
 | [`/akita`](./skills/engineering/akita/SKILL.md) | Reviewing a PR or a plan for production-readiness | It works is 25% of the effort. Minimum now, observed evolution later. |
 | [`/codebase-design`](./skills/engineering/codebase-design/SKILL.md) | Deciding where code should live | Depth: a lot of behaviour behind a small interface. Apply the deletion test. |
 | [`/domain-modeling`](./skills/engineering/domain-modeling/SKILL.md) | The words have gone fuzzy and arguments go in circles | Make each word mean one thing, write it down, use it in the code. |
