@@ -50,7 +50,7 @@ function discoverPersonas(): Persona[] {
 
 function parseFrontmatterFlag(content: string, key: string): boolean {
   const m = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!m) return false;
+  if (!m) { console.error(`[eval-reviewer] missing frontmatter in reference file`); return false; }
   const re = new RegExp(`^${key}:\\s*(true|false)`, "m");
   const vm = m[1]!.match(re);
   return vm?.[1] === "true";
@@ -62,10 +62,11 @@ interface Config { provider: string; model: string; mode: string; concurrency: n
 
 function loadConfig(explicit?: string, repoRoot?: string): Config {
   const files = [explicit, repoRoot ? join(repoRoot, "eval-reviewer.config.json") : undefined, join(ROOT, "eval-reviewer.config.json")].filter(Boolean) as string[];
-  const c = files.find(f => existsSync(f)) ? JSON.parse(readFileSync(files.find(f => existsSync(f))!, "utf-8")) : {};
+  const found = files.find(f => existsSync(f));
+  const c = found ? JSON.parse(readFileSync(found, "utf-8")) : {};
   return {
-    provider: c.provider ?? "claude-code",
-    model: c.model ?? "claude-sonnet-4-6",
+    provider: c.provider ?? "pi",
+    model: c.model ?? "omniroute/free-stack",
     mode: c.mode ?? "local",
     concurrency: c.concurrency ?? 6,
     idleTimeoutSeconds: c.idleTimeoutSeconds ?? 300,
@@ -115,11 +116,29 @@ function resolveRoot(flags: Record<string, string>) {
   return git(["rev-parse", "--show-toplevel"]) || fail("not in a git repo");
 }
 
-function resolveTarget(flags: Record<string, string>, root: string) {
-  if (flags.diff) { const t = git(["diff", `${flags.diff}...HEAD`], root); if (t) return { target: t, label: `diff ${flags.diff}...HEAD` }; fail("empty diff"); }
-  const w = git(["diff", "HEAD"], root); if (w) return { target: w, label: "working tree" };
-  const b = git(["diff", "main...HEAD"], root) || git(["diff", "master...HEAD"], root); if (b) return { target: b, label: "branch diff" };
-  if (flags._) { const p = resolve(flags._); if (existsSync(p)) return { target: readFileSync(p, "utf-8"), label: flags._! }; return { target: flags._, label: "inline text" }; }
+interface Target { target: string; fullDiff: string; label: string; baseRef: string; diffStat: string }
+
+function resolveTarget(flags: Record<string, string>, root: string): Target {
+  // Branch diff: --diff REF
+  if (flags.diff) {
+    const d = git(["diff", `${flags.diff}...HEAD`], root);
+    if (d) return { target: d, fullDiff: d, label: `diff ${flags.diff}...HEAD`, baseRef: flags.diff, diffStat: git(["diff", `${flags.diff}...HEAD`, "--stat"], root) };
+    fail("empty diff");
+  }
+  // Working tree changes
+  const w = git(["diff", "HEAD"], root);
+  if (w) return { target: w, fullDiff: w, label: "working tree", baseRef: "HEAD", diffStat: git(["diff", "HEAD", "--stat"], root) };
+  // Branch diff against main/master
+  for (const b of ["main", "master"]) {
+    const d = git(["diff", `${b}...HEAD`], root);
+    if (d) return { target: d, fullDiff: d, label: `branch diff (${b})`, baseRef: b, diffStat: git(["diff", `${b}...HEAD`, "--stat"], root) };
+  }
+  // Explicit file or inline text — no git ref
+  if (flags._) {
+    const p = resolve(flags._);
+    const content = existsSync(p) ? readFileSync(p, "utf-8") : flags._;
+    return { target: content, fullDiff: content, label: flags._, baseRef: "", diffStat: "" };
+  }
   fail("nothing to review");
 }
 
@@ -149,6 +168,7 @@ function expandTilde(p: string) { return p.startsWith("~") ? join(homedir(), p.s
 function sandbox(mode: string, cfg: Config) {
   if (mode === "local") return noSandbox();
   if (mode !== "docker") fail(`mode must be local or docker, got ${mode}`);
+  if (!cfg.docker) fail("docker mode requires a [docker] section in eval-reviewer.config.json");
   if (!existsSync("/usr/bin/docker") && !existsSync("/usr/local/bin/docker")) fail("docker not found on PATH");
   try { execFileSync("docker", ["image", "inspect", cfg.docker!.image], { stdio: "ignore" }); }
   catch {
@@ -166,12 +186,14 @@ function sandbox(mode: string, cfg: Config) {
 
 interface PersonaResult { persona: string; status: "done" | "failed"; findings: Finding[]; verdict: string; error?: string }
 
-async function runPersona(persona: Persona, target: string, cfg: Config, root: string, sb: ReturnType<typeof sandbox>): Promise<PersonaResult> {
+async function runPersona(persona: Persona, tgt: Target, cfg: Config, root: string, sb: ReturnType<typeof sandbox>): Promise<PersonaResult> {
   try {
     const r = await sandcastle.run({
       agent: createAgent(cfg.provider, cfg.model),
-      sandbox: sb, cwd: root, name: persona.name, promptFile: persona.path, promptArgs: { TARGET: target },
+      sandbox: sb, cwd: root, name: persona.name, promptFile: persona.path,
+      promptArgs: { TARGET: tgt.target, DIFF_STAT: tgt.diffStat, BASE_REF: tgt.baseRef },
       maxIterations: 1, idleTimeoutSeconds: cfg.idleTimeoutSeconds,
+      logging: { type: "stdout" },
       output: sandcastle.Output.object({ tag: "review", schema: ReviewSchema, maxRetries: cfg.retries }),
     });
     return { persona: persona.name, status: "done", findings: r.output.findings, verdict: r.output.verdict };
@@ -239,7 +261,7 @@ const flags = parseFlags(process.argv.slice(2));
 const root = resolveRoot(flags);
 const config = loadConfig(flags.config, root);
 const mode = flags.mode ?? (process.env.CI ? "local" : config.mode);
-const { target, label } = resolveTarget(flags, root);
+const tgt = resolveTarget(flags, root);
 
 let personas = discoverPersonas();
 if (!personas.length) fail(`no persona files found in ${REFERENCES}`);
@@ -253,11 +275,11 @@ const sb = sandbox(mode, config);
 
 const results: PersonaResult[] = [];
 for (let i = 0; i < personas.length; i += config.concurrency) {
-  results.push(...await Promise.all(personas.slice(i, i + config.concurrency).map(p => runPersona(p, target, config, root, sb))));
+  results.push(...await Promise.all(personas.slice(i, i + config.concurrency).map(p => runPersona(p, tgt, config, root, sb))));
 }
 
 const findings = mergeFindings(results);
-const verdict = buildVerdict(results, findings, personas, { target: label, model: config.model, mode });
+const verdict = buildVerdict(results, findings, personas, { target: tgt.label, model: config.model, mode });
 const report = renderReport(results, findings, verdict);
 
 const outDir = isAbsolute(config.outDir) ? config.outDir : join(root, config.outDir);
@@ -267,7 +289,7 @@ writeFileSync(join(outDir, "report.md"), report);
 writeFileSync(join(outDir, "verdict.json"), `${JSON.stringify(verdict, null, 2)}\n`);
 
 if (process.env.GITHUB_STEP_SUMMARY) writeFileSync(process.env.GITHUB_STEP_SUMMARY, report);
-if (flags.pr) postToPr(findings, target, flags.pr, verdict);
+if (flags.pr) postToPr(findings, tgt.fullDiff, flags.pr, verdict);
 
 console.log(`\n  VERDICT: ${verdict.overall}\n`);
 if (verdict.overall === "INCOMPLETE") process.exit(3);

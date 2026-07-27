@@ -16,7 +16,11 @@ Deletable code, premature abstraction, anticipatory design, dead code, over-engi
 
 ## The Code to Review
 
+Changed files:
+{{DIFF_STAT}}
 {{TARGET}}
+
+You have bash access. Run `git diff {{BASE_REF}}...HEAD -- <path>` to see a file's full diff.
 
 ## Output Format
 
