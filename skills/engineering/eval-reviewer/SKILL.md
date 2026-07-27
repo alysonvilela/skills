@@ -10,7 +10,7 @@ Six personas review the same diff independently and simultaneously — no person
 
 ## The one rule
 
-You run the orchestrator and present what it produces. You do not review the code yourself — that's what the six subprocess personas are for — and you do not hand-edit `scripts/orchestrator.ts` or `scripts/spawn-agent.ts` mid-task to route around a problem. If the tool misbehaves, that's a bug to report, not a patch to make silently.
+Run the orchestrator and present what it produces — the six subprocess personas do the reviewing, you don't. If the tool misbehaves mid-task, report it as a bug; hand-editing `scripts/orchestrator.ts` or `scripts/spawn-agent.ts` to route around the problem hides the failure instead of surfacing it.
 
 ## Steps
 
@@ -30,11 +30,11 @@ The orchestrator takes a **file path** (or literal inline text passed as the arg
 bun scripts/orchestrator.ts <target> [--personas a,b,c] [--timeout 300] [--strategy qwen]
 ```
 
-Defaults: all 6 personas, 300s timeout each, `qwen` CLI headless. Only `qwen` and `claude` are implemented — `generic` is an unfinished stub that always writes an error result, don't select it.
+Defaults: all 6 personas, 300s timeout each, `qwen` CLI headless. `qwen` and `claude` are the two working strategies — `generic` is an unfinished stub that always writes an error result.
 
 Personas launch in batches of 4 concurrent, and the orchestrator waits for each batch to fully exit before starting the next — with all 6 selected, that's two sequential batches, not one instant fan-out of six. Budget wait time accordingly.
 
-Both spawn strategies run the reviewer CLI in an auto-approve mode (`qwen --yolo`, `claude --dangerously-skip-permissions`). The persona prompt instructs "review only, never edit" but nothing at the process level enforces that — don't point this at a target you wouldn't hand to an unsupervised agent.
+Both spawn strategies run the reviewer CLI in an auto-approve mode (`qwen --yolo`, `claude --dangerously-skip-permissions`). The persona prompt instructs "review only, never edit," but enforcement stops there — treat the target the way you'd treat one you were handing to an unsupervised agent, since nothing at the process level backs the instruction up.
 
 **Done when:** the process has exited. Its exit code is the verdict: `0`=PASS, `1`=CONTESTED, `2`=REJECT, `3`=INCOMPLETE.
 
