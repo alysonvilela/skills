@@ -218,6 +218,15 @@ A `PASS` requires that every selected persona reported. A critical persona faili
 
 - **Bun**, **Node 22.18+**, or `npx tsx`
 - **One agent CLI on PATH** — `pi`, `claude`, or `codex`, whichever `agent.provider` names. Local mode uses the one you already have; docker mode installs it into the image.
+
+  The run header prints the **full path** of the CLI it resolved, because more than one copy is easy to end up with — an `npm i -g` one and a `bun add -g` one, in different bin directories — and PATH order silently decides which runs. An old build that cannot load your extensions exits `0` having printed nothing, which reads like a review that found nothing. When a persona produces no output at all, the failure says so by name rather than blaming the missing tag:
+
+  ```
+  ✗ skeptic — failed: /home/lab/.nvm/versions/node/v24.15.0/bin/pi produced no
+    output at all — the review never ran. […] A second, older copy of the CLI
+    earlier on PATH fails exactly this way.
+  ```
+
 - **Docker**, only for `mode: "docker"`
 - **`gh`** only if you feed it a GitHub PR — the runner accepts a local path, inline text, or a git ref, and fetches nothing itself
 

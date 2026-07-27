@@ -218,14 +218,23 @@ function fail(message: string, ...detail: string[]): never {
   process.exit(1);
 }
 
-function onPath(binary: string): boolean {
+/**
+ * Where PATH says the binary is, or undefined. The full path is printed in the
+ * header on purpose: more than one version of an agent CLI can be installed
+ * (a global npm one and a bun one), PATH order decides which runs, and the
+ * loser is often an old build that fails silently.
+ */
+function whichBinary(binary: string): string | undefined {
   try {
-    execFileSync(process.platform === "win32" ? "where" : "which", [binary], {
-      stdio: "ignore",
-    });
-    return true;
+    return execFileSync(
+      process.platform === "win32" ? "where" : "which",
+      [binary],
+      { encoding: "utf-8" }
+    )
+      .split("\n")[0]
+      ?.trim();
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -416,6 +425,8 @@ interface Runtime {
   agentEnv: Record<string, string>;
   sandbox: () => sandcastle.SandboxProvider;
   /** What the header prints as the source of the agent's credentials. */
+  /** Resolved path of the agent CLI in local mode; undefined in docker mode. */
+  cliPath?: string;
   authNote: string;
 }
 
@@ -453,7 +464,8 @@ function preflight(config: Config, mode: "local" | "docker"): Runtime {
     // auth — an OAuth token on disk, a provider registry, an exported key — and
     // demanding one specific variable is what blocked runs that would have
     // worked. If the CLI is there, authenticating is the harness's job.
-    if (!onPath(agent.cli)) {
+    const cliPath = whichBinary(agent.cli);
+    if (!cliPath) {
       fail(
         `local mode runs "${agent.cli}" on this machine, but it is not on PATH.`,
         `Install it with: npm i -g ${agent.npmPackage}`,
@@ -464,11 +476,12 @@ function preflight(config: Config, mode: "local" | "docker"): Runtime {
       agentName,
       agentEnv: {},
       sandbox: () => noSandbox(),
-      authNote: `${agent.cli} on this host (inherits this shell)`,
+      cliPath,
+      authNote: `${cliPath} (inherits this shell)`,
     };
   }
 
-  if (!onPath("docker")) {
+  if (!whichBinary("docker")) {
     fail(
       "docker mode needs docker on PATH.",
       'Install it, or set execution.mode to "local" in the config.'
@@ -597,6 +610,7 @@ async function reviewWith(
   const { config, runtime, target, repoRoot, outDir } = context;
   const logPath = join(outDir, persona.name, "agent.log");
   mkdirSync(dirname(logPath), { recursive: true });
+  let spoke = false;
 
   try {
     const result = await sandcastle.run({
@@ -620,7 +634,17 @@ async function reviewWith(
       // the branch, and the merge — six worktrees of a large repo was most of
       // the wall time, spent isolating writes that never happen.
       idleTimeoutSeconds: config.execution.idleTimeoutSeconds,
-      logging: { type: "file", path: logPath },
+      logging: {
+        type: "file",
+        path: logPath,
+        // Did the CLI say anything at all? A run that fails having emitted
+        // nothing is a broken CLI, not a model that ignored the format — and
+        // reporting the second when it was the first sends everyone hunting
+        // through prompts for a bug that was on PATH.
+        onAgentStreamEvent: () => {
+          spoke = true;
+        },
+      },
       output: sandcastle.Output.object({
         tag: OUTPUT_TAG,
         schema: ReviewSchema,
@@ -638,7 +662,16 @@ async function reviewWith(
       verdict: result.output.verdict,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = spoke
+      ? error instanceof Error
+        ? error.message
+        : String(error)
+      : `${runtime.cliPath ?? runtime.agentName} produced no output at all — ` +
+        `the review never ran. Check that this is the CLI you think it is ` +
+        `(\`${runtime.agentName === "pi" ? "pi" : runtime.agentName} --version\`), ` +
+        `that its model is reachable, and that it starts without errors on stderr. ` +
+        `A second, older copy of the CLI earlier on PATH fails exactly this way. ` +
+        `Full transcript: ${logPath}`;
     console.log(`  ✗ ${persona.name} — failed: ${message}`);
     return {
       persona: persona.name,

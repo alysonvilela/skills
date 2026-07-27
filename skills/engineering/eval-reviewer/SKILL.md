@@ -44,6 +44,8 @@ Written into the reviewed repo: `.eval-reviewer/report.md` and `.eval-reviewer/v
 
 If a persona failed, both files say so by name and carry the error — `report.md` gets a "Personas That Did Not Report" section, and `verdict.json` puts the message on that persona's entry.
 
+Read that error before theorising. `produced no output at all` is an environment problem — usually a second, older copy of the agent CLI earlier on PATH, and the header names the exact binary that ran. `tag <review> not found` with a talkative transcript is the opposite: the CLI worked and the model ignored the format, which is a `agent.model` decision, not a prompt bug. Do not go editing `references/` for either one.
+
 **Done when:** you've read both — the markdown is for the user, the JSON has the structured breakdown you need to reason about the verdict.
 
 ### 3 — Present
