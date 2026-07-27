@@ -20,9 +20,17 @@ bun <skill>/scripts/review.ts
 
 That is the whole setup and invocation. With no arguments it reviews the work in progress — uncommitted changes, or a clean tree's branch against its base. The first run auto-installs the one dependency (`@ai-hero/sandcastle`).
 
+Personas are auto-discovered from `references/*.md`. To disable one, move it to `references/_unused/`.
+
 ## Architecture
 
 ```
+┌───────────────────────────────────────────────────────┐
+│               filesystem → references/*.md              │
+│                    (auto-discovered)                    │
+└───────────────────────────────────────────────────────┘
+                           │
+                           ▼
 ┌───────────────────────────────────────────────────────┐
 │                  review.ts (~190 lines)                │
 │                                                       │
@@ -77,31 +85,25 @@ All six run at once by default (`concurrency`), so the wait is the slowest perso
 
 ## How it works
 
-1. **Configure** — `eval-reviewer.config.json`. The repo's copy wins; fallback to the skill's own.
-2. **Run** — [Sandcastle](https://github.com/ai-hero-dev/sandcastle) sends each persona's prompt file to the configured agent (`provider`), locally or in Docker.
-3. **Collect** — each persona emits `<review>` JSON. Sandcastle validates and retries on failure.
-4. **Merge** — findings are deduplicated, ranked by severity. Plain code, not an LLM.
-5. **Verdict** — **PASS**, **CONTESTED**, **REJECT**, or **INCOMPLETE**.
-
-The target arrives as a Sandcastle prompt argument, which is inert by contract: `` !`command` `` and `{{KEY}}` inside an argument's value are never expanded, so nothing in the reviewed diff is interpreted as anything but text.
+1. **Personas** — auto-discovered from `references/*.md`. Each file's frontmatter sets `critical: true|false`.
+2. **Configure** — `eval-reviewer.config.json`. The repo's copy wins; fallback to the skill's own.
+3. **Run** — [Sandcastle](https://github.com/ai-hero-dev/sandcastle) sends each persona's prompt file to the configured agent (`provider`), locally or in Docker.
+4. **Collect** — each persona emits `<review>` JSON. Sandcastle validates and retries on failure.
+5. **Merge** — findings are deduplicated, ranked by severity. Plain code, not an LLM.
+6. **Verdict** — **PASS**, **CONTESTED**, **REJECT**, or **INCOMPLETE**.
 
 ## Configuration
 
 Everything lives in `eval-reviewer.config.json`. Copy [the skill's own](./eval-reviewer.config.json) to a repo's root to override it there. Every field is optional.
 
 | Field | Default | What it decides |
-|---|---|---|---|
-| `provider` | `pi` | `pi`, `claude-code`, or `codex` |
-| `model` | `lm-studio/gemma-4-e2b-it` | model string the provider resolves |
-| `thinking` | `medium` | `off` … `xhigh` |
+|---|---|---|
+| `provider` | `claude-code` | `pi`, `claude-code`, or `codex` — which CLI runs each persona |
+| `model` | `claude-sonnet-4-6` | the model string the provider resolves |
 | `mode` | `local` | `local` or `docker` |
 | `concurrency` | `6` | personas alive at once |
 | `idleTimeoutSeconds` | `300` | seconds without output before a persona is stuck |
 | `retries` | `2` | re-asks on JSON validation failure |
-| `docker.image` | `sandcastle:eval-reviewer` | built on first docker-mode run |
-| `docker.mounts` | pi's `auth.json`, `models.json` | files the container reads from the host |
-| `docker.forwardEnv` | `OPENAI_API_KEY` | env vars copied into the container |
-| `personas` | all six | `name` matches `references/<name>.md` |
 | `failOn` | `high` | severity that exits non-zero |
 | `outDir` | `.eval-reviewer` | where the report lands |
 
@@ -111,41 +113,32 @@ Flags: `--personas`, `--fail-on`, `--config`, `--diff`, `--pr`, `--repo`, `--mod
 
 **Local mode**: the script runs the agent CLI on this machine and inherits your shell — whatever authenticates your harness authenticates the review.
 
-**Docker mode**: a container gets none of the host's auth. It carries only what `docker.mounts` and `docker.forwardEnv` specify. Mount the *files* the agent reads (not the directory it writes sessions into), and set `docker.forwardEnv` to the environment variables it needs.
+**Docker mode**: a container gets none of the host's auth. It carries only what `docker.mounts` and `docker.forwardEnv` specify.
 
 Under CI the mode is forced to `local`: a runner is already a disposable VM.
 
-### OpenAI-compatible endpoints
-
-The agent reaches any OpenAI-compatible endpoint through a provider entry in its config. For pi, that's `~/.pi/agent/models.json`:
-
-```json
-{
-  "providers": {
-    "my-api": {
-      "baseUrl": "https://api.example.com/v1",
-      "api": "openai-completions",
-      "apiKey": "$OPENAI_API_KEY",
-      "models": [{ "id": "my-model" }]
-    }
-  }
-}
-```
-
-Then set `model: "my-api/my-model"` in `eval-reviewer.config.json`. In local mode that's all. In Docker mode, add `OPENAI_API_KEY` to `docker.forwardEnv` and ensure `~/.pi/agent/models.json` is in `docker.mounts`.
-
 ## Personas
 
-| Persona | Focus | Catches |
-|---------|-------|---------|
-| **Skeptic** ★ | Correctness, completeness | Bugs, race conditions, unhandled errors, unproven assumptions |
-| **Architect** ★ | Structural fitness | Coupling, boundary violations, scaling assumptions, responsibility leaks |
-| **Security** ★ | Safety boundaries | Data exposure, unsafe modifications, third-party API risks |
-| **Minimalist** | Necessity, simplicity | Over-engineering, premature abstraction, dead complexity |
-| **Performance** | Bottlenecks, efficiency | Blocking calls, N+1 queries, memory leaks, thread misuse |
-| **Test Coverage** | Scenario completeness | Missing edge cases, weak assertions, untested error paths |
+Personas are auto-discovered from `references/*.md`. Each file's frontmatter sets `critical: true/false`:
 
-Each file in [`references/`](./references) is the prompt, sent to the agent as written — `{{TARGET}}` is where the reviewed code lands. Nothing wraps it, so a persona is changed by editing its file, and added by writing a new one plus a line in `review.personas`.
+```markdown
+---
+critical: true
+---
+```
+
+| Persona | Critical | Focus | Catches |
+|---|---|---|---|
+| **Skeptic** | ★ | Correctness, completeness | Bugs, race conditions, unhandled errors, unproven assumptions |
+| **Architect** | ★ | Structural fitness | Coupling, boundary violations, scaling assumptions, responsibility leaks |
+| **Security** | ★ | Safety boundaries | Data exposure, unsafe modifications, third-party API risks |
+| **Minimalist** | | Necessity, simplicity | Over-engineering, premature abstraction, dead complexity |
+| **Performance** | | Bottlenecks, efficiency | Blocking calls, N+1 queries, memory leaks, thread misuse |
+| **Test Coverage** | | Scenario completeness | Missing edge cases, weak assertions, untested error paths |
+
+**Adding a persona**: drop a `.md` file in `references/` with frontmatter (`critical:`), the agent prompt (use `{{TARGET}}` for the diff), and instruct it to emit `<review>` JSON.
+
+**Disabling a persona**: move it to `references/_unused/`. The runner ignores that directory.
 
 ## Usage
 
@@ -207,6 +200,7 @@ Written into the reviewed repo, in a directory that ignores itself — nothing t
   ],
   "target": "git diff main...HEAD",
   "mode": "local",
+  "model": "claude-sonnet-4-6",
   "timestamp": "2026-07-27T12:00:00.000Z"
 }
 ```
@@ -223,12 +217,10 @@ gh pr comment 42 --body-file .eval-reviewer/report.md
 jq -e '.breakdown.critical == 0' .eval-reviewer/verdict.json
 ```
 
-The CI workflow posts the report as a PR comment via `gh pr comment`. For inline review comments (previously a separate `pr-comment.ts` script), pass `--pr NUMBER` to `review.ts` — it validates anchors against the diff before posting.
-
 ## Requirements
 
 - **Bun**, **Node 22.18+**, or `npx tsx`
-- **An agent CLI on PATH** — whichever `provider` names in the config
+- **An agent CLI on PATH** — whichever `provider` names in the config (default: `claude-code`, get a token with `claude setup-token`)
 - **Docker**, only for `mode: docker`
 
 ## Publish

@@ -34,7 +34,9 @@ Never a URL — the runner fetches nothing itself.
 
 `node` (22.18+) and `npx tsx` work in place of `bun`. There is no setup step: the first run auto-installs `@ai-hero/sandcastle`.
 
-All six personas run at once by default (`concurrency`), so the wait is the slowest persona rather than the sum.
+Personas are discovered from `references/*.md`. To disable one, move it to `references/_unused/`.
+
+All discovered personas run at once by default (`concurrency`), so the wait is the slowest persona rather than the sum.
 
 **Done when:** the process has exited. Its exit code is the gate: `0`=clean, `1`=findings at or above `failOn`, `2`=critical findings, `3`=incomplete run.
 
@@ -56,60 +58,93 @@ One file, `eval-reviewer.config.json`. The runner reads the copy in the reviewed
 
 | Field | Default | What it decides |
 |---|---|---|
-| `provider` | `pi` | `pi`, `claude-code`, or `codex` — which CLI runs each persona |
-| `model` | `lm-studio/gemma-4-e2b-it` | the model string the provider resolves |
-| `thinking` | `medium` | `off` … `xhigh` |
+| `provider` | `claude-code` | `pi`, `claude-code`, or `codex` — which CLI runs each persona |
+| `model` | `claude-sonnet-4-6` | the model string the provider resolves |
 | `mode` | `local` | `local` or `docker` |
 | `concurrency` | `6` | personas alive at once |
 | `idleTimeoutSeconds` | `300` | seconds without output before a persona is stuck |
 | `retries` | `2` | re-asks on JSON validation failure |
-| `docker.image` | `sandcastle:eval-reviewer` | built on first docker-mode run |
-| `docker.mounts` | pi's `auth.json`, `models.json` | files the container reads from the host |
-| `docker.forwardEnv` | `OPENAI_API_KEY` | env vars copied into the container |
-| `personas` | all six | `name` matches `references/<name>.md` |
 | `failOn` | `high` | severity that exits non-zero |
 | `outDir` | `.eval-reviewer` | where the report lands |
+
+Personas are **not** configured in JSON. Each `.md` file in `references/` is a persona; move one to `references/_unused/` to disable it. Each file's frontmatter marks its `critical` status.
 
 ### Credentials
 
 In `local` mode the script runs the agent CLI on this machine and inherits your shell, so whatever authenticates your harness authenticates the review.
 
-In `docker` mode the container gets none of that — it carries only what `docker.mounts` and `docker.forwardEnv` specify. Mount the *files* the agent reads (not the directory it writes sessions into), and set `docker.forwardEnv` to the environment variables it needs.
+In `docker` mode the container gets none of that — it carries only what `docker.mounts` and `docker.forwardEnv` specify.
 
 Under CI the mode is forced to `local`: a runner is already a disposable VM.
 
-## Personas (prompts in `references/`)
+## Personas
 
-| Persona | Focus | Catches |
+Personas are auto-discovered from `references/*.md`. Each file's frontmatter sets `critical: true/false`:
+
+```markdown
+---
+critical: true
+---
+```
+
+| Persona | Critical | Focus |
 |---|---|---|
-| **Skeptic** ★ | Correctness, completeness | Bugs, race conditions, unhandled errors, unproven assumptions |
-| **Architect** ★ | Structural fitness | Coupling, boundary violations, scaling assumptions, responsibility leaks |
-| **Security** ★ | Safety boundaries | Data exposure, unsafe modifications, third-party API risks |
-| **Minimalist** | Necessity, simplicity | Over-engineering, premature abstraction, dead complexity |
-| **Performance** | Bottlenecks, efficiency | Blocking calls, N+1 queries, memory leaks, thread misuse |
-| **Test Coverage** | Scenario completeness | Missing edge cases, weak assertions, untested error paths |
+| **Skeptic** | ★ | Correctness, completeness, edge cases |
+| **Architect** | ★ | Structural fitness, coupling, boundaries |
+| **Security** | ★ | Data exposure, injection, permissions |
+| **Minimalist** | | Necessity, simplicity, over-engineering |
+| **Performance** | | Bottlenecks, efficiency, scaling |
+| **Test Coverage** | | Missing cases, weak assertions, flaky tests |
 
-★ marks a persona the review can't be trusted without.
+★ = critical persona — if this persona fails, the verdict is `INCOMPLETE`.
 
-**Each file in `references/` is the prompt, sent as written.** `{{TARGET}}` is where the reviewed code lands. Nothing wraps it, so changing what a persona looks for is an edit to that one file — and adding a persona is a new file plus one line in `personas`.
+To add a persona, drop a `.md` file in `references/` with the format:
+- Frontmatter: `critical: true|false`
+- Body: the prompt sent to the agent, using `{{TARGET}}` where the diff lands
+- Output instruction: emit JSON inside `<review>` tags with `findings` and `verdict`
 
-## Report
+To disable a persona without deleting it, move it to `references/_unused/`.
 
-`report.md`: a verdict line, a severity-count table, an agent-status table, a failure section when any persona didn't report, then findings grouped and sorted by severity.
+## Output
 
-`verdict.json`:
+- **`.eval-reviewer/report.md`** — the full report, and the GitHub job summary when running in Actions
+- **`.eval-reviewer/verdict.json`** — the verdict, the severity breakdown, per-persona status, and the merged findings
+- **`.eval-reviewer/<persona>/agent.log`** — that persona's full agent transcript
+
+Written into the reviewed repo, in a directory that ignores itself — nothing to add to the repo's `.gitignore`.
+
 ```json
 {
-  "overall": "PASS|CONTESTED|REJECT|INCOMPLETE",
-  "breakdown": { "critical": 0, "high": 0, "medium": 0, "low": 0 },
+  "overall": "CONTESTED",
+  "breakdown": { "critical": 0, "high": 1, "medium": 2, "low": 0 },
   "agents": {
-    "skeptic": { "status": "done", "critical": true, "findings": 2, "verdict": "contest" }
+    "skeptic": { "status": "done", "critical": true, "findings": 2, "verdict": "contest" },
+    "performance": { "status": "failed", "critical": false, "findings": 0, "verdict": "contest", "error": "..." }
   },
-  "findings": [...],
+  "findings": [
+    {
+      "severity": "high",
+      "file": "src/math.js",
+      "line": 6,
+      "message": "Division by zero returns Infinity with no guard.",
+      "suggestion": "Throw a RangeError when b === 0."
+    }
+  ],
   "target": "git diff main...HEAD",
-  "model": "lm-studio/gemma-4-e2b-it",
-  "timestamp": "..."
+  "mode": "local",
+  "model": "claude-sonnet-4-6",
+  "timestamp": "2026-07-27T12:00:00.000Z"
 }
 ```
 
-`PASS` requires that every selected persona reported. A star persona failing makes the run `INCOMPLETE`; any persona failing makes an otherwise-empty run `INCOMPLETE` too.
+A `PASS` requires that every selected persona reported. A critical persona failing makes the run `INCOMPLETE`; any persona failing makes an otherwise-empty run `INCOMPLETE` too, because "nothing found" from a partial review is an unknown result, not a clean one. Findings stand on their own either way.
+
+## Requirements
+
+- **Bun**, **Node 22.18+**, or `npx tsx`
+- **An agent CLI on PATH** — whichever `provider` names in the config (default: `claude-code`, get a token with `claude setup-token`)
+- **Docker**, only for `mode: docker`
+
+## License
+
+MIT

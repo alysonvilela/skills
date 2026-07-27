@@ -1,27 +1,4 @@
 {
-  "provider": "pi",
-  "model": "lm-studio/gemma-4-e2b-it",
-  "thinking": "medium",
-  "mode": "local",
-  "concurrency": 6,
-  "idleTimeoutSeconds": 300,
-  "retries": 2,
-  "docker": {
-    "image": "sandcastle:eval-reviewer",
-    "mounts": [
-      { "hostPath": "~/.pi/agent/auth.json", "sandboxPath": "~/.pi/agent/auth.json", "readonly": true },
-      { "hostPath": "~/.pi/agent/models.json", "sandboxPath": "~/.pi/agent/models.json", "readonly": true }
-    ],
-    "forwardEnv": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
-  },
-  "personas": [
-    { "name": "skeptic", "critical": true },
-    { "name": "architect", "critical": true },
-    { "name": "security", "critical": true },
-    { "name": "minimalist", "critical": false },
-    { "name": "performance", "critical": false },
-    { "name": "test-coverage", "critical": false }
-  ],
-  "failOn": "high",
-  "outDir": ".eval-reviewer"
+  "provider": "claude-code",
+  "model": "claude-sonnet-4-6"
 }

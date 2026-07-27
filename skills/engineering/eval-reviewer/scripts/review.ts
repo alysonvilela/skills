@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname, isAbsolute, resolve } from "node:path";
+import { join, dirname, isAbsolute, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import * as sandcastle from "@ai-hero/sandcastle";
@@ -10,6 +10,7 @@ import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+const REFERENCES = join(ROOT, "references");
 
 // Auto-install deps on first run
 if (!existsSync(join(ROOT, "node_modules", "@ai-hero", "sandcastle"))) {
@@ -21,34 +22,57 @@ if (!existsSync(join(ROOT, "node_modules", "@ai-hero", "sandcastle"))) {
 
 // ─── Agent providers ─────────────────────
 
-const AGENTS: Record<string, (model: string, opts: Record<string, unknown>) => sandcastle.AgentProvider> = {
-  pi: (m, o) => sandcastle.pi(m, o),
-  "claude-code": (m, o) => sandcastle.claudeCode(m, { ...o, permissionMode: "bypassPermissions" }),
-  codex: (m, o) => sandcastle.codex(m, o),
-};
+function createAgent(provider: string, model: string): sandcastle.AgentProvider {
+  switch (provider) {
+    case "pi": return sandcastle.pi(model, { thinking: "medium" });
+    case "codex": return sandcastle.codex(model, { effort: "high" });
+    default: return sandcastle.claudeCode(model, { effort: "high", permissionMode: "bypassPermissions" });
+  }
+}
 
-// ─── Config (reads JSON) ─────────────────
+// ─── Persona discovery (filesystem-based) ─
 
-interface Mount { hostPath: string; sandboxPath: string; readonly: boolean }
-interface Config { provider: string; model: string; thinking: string; mode: string; concurrency: number; idleTimeoutSeconds: number; retries: number; failOn: string; outDir: string; personas: { name: string; critical: boolean }[]; docker: { image: string; mounts: Mount[]; forwardEnv: string[] } }
+interface Persona { name: string; critical: boolean; path: string }
+
+function discoverPersonas(): Persona[] {
+  if (!existsSync(REFERENCES)) return [];
+  const result: Persona[] = [];
+  for (const f of readdirSync(REFERENCES, { withFileTypes: true })) {
+    if (!f.isFile() || !f.name.endsWith(".md")) continue;
+    const name = basename(f.name, ".md");
+    const fp = join(REFERENCES, f.name);
+    const content = readFileSync(fp, "utf-8");
+    const critical = parseFrontmatterFlag(content, "critical");
+    result.push({ name, critical, path: fp });
+  }
+  return result;
+}
+
+function parseFrontmatterFlag(content: string, key: string): boolean {
+  const m = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!m) return false;
+  const re = new RegExp(`^${key}:\\s*(true|false)`, "m");
+  const vm = m[1]!.match(re);
+  return vm?.[1] === "true";
+}
+
+// ─── Config ──────────────────────────────
+
+interface Config { provider: string; model: string; mode: string; concurrency: number; idleTimeoutSeconds: number; retries: number; failOn: string; outDir: string; docker?: { image: string; mounts: { hostPath: string; sandboxPath: string; readonly: boolean }[]; forwardEnv: string[] } }
 
 function loadConfig(explicit?: string, repoRoot?: string): Config {
-  const c = JSON.parse(readFileSync(
-    [explicit, join(repoRoot ?? "", "eval-reviewer.config.json"), join(ROOT, "eval-reviewer.config.json")]
-      .find(f => f && existsSync(resolve(f))) ?? fail("config not found"), "utf-8"));
+  const files = [explicit, repoRoot ? join(repoRoot, "eval-reviewer.config.json") : undefined, join(ROOT, "eval-reviewer.config.json")].filter(Boolean) as string[];
+  const c = files.find(f => existsSync(f)) ? JSON.parse(readFileSync(files.find(f => existsSync(f))!, "utf-8")) : {};
   return {
-    provider: c.provider ?? "pi", model: c.model ?? "lm-studio/gemma-4-e2b-it", thinking: c.thinking ?? "medium",
-    mode: c.mode ?? "local", concurrency: c.concurrency ?? 6, idleTimeoutSeconds: c.idleTimeoutSeconds ?? 300, retries: c.retries ?? 2,
-    failOn: c.failOn ?? "high", outDir: c.outDir ?? ".eval-reviewer",
-    personas: c.personas ?? [
-      { name: "skeptic", critical: true }, { name: "architect", critical: true }, { name: "security", critical: true },
-      { name: "minimalist", critical: false }, { name: "performance", critical: false }, { name: "test-coverage", critical: false },
-    ],
-    docker: {
-      image: c.docker?.image ?? "sandcastle:eval-reviewer",
-      mounts: c.docker?.mounts ?? [],
-      forwardEnv: c.docker?.forwardEnv ?? [],
-    },
+    provider: c.provider ?? "claude-code",
+    model: c.model ?? "claude-sonnet-4-6",
+    mode: c.mode ?? "local",
+    concurrency: c.concurrency ?? 6,
+    idleTimeoutSeconds: c.idleTimeoutSeconds ?? 300,
+    retries: c.retries ?? 2,
+    failOn: c.failOn ?? "high",
+    outDir: c.outDir ?? ".eval-reviewer",
+    docker: c.docker ? { image: c.docker.image ?? "sandcastle:eval-reviewer", mounts: c.docker.mounts ?? [], forwardEnv: c.docker.forwardEnv ?? [] } : undefined,
   };
 }
 
@@ -112,7 +136,7 @@ function parseDiffLines(d: string) {
   return files;
 }
 
-// ─── Sandcastle output schema ────────────
+// ─── Schema ──────────────────────────────
 
 const FindingSchema = z.object({ severity: z.enum(["critical", "high", "medium", "low"]), file: z.string().min(1), line: z.coerce.number().int().positive().nullish(), message: z.string().min(1), suggestion: z.string().min(1) });
 const ReviewSchema = z.object({ findings: z.array(FindingSchema).default([]), verdict: z.enum(["pass", "contest", "reject"]) });
@@ -126,39 +150,32 @@ function sandbox(mode: string, cfg: Config) {
   if (mode === "local") return noSandbox();
   if (mode !== "docker") fail(`mode must be local or docker, got ${mode}`);
   if (!existsSync("/usr/bin/docker") && !existsSync("/usr/local/bin/docker")) fail("docker not found on PATH");
-  // Build image on first use
-  try { execFileSync("docker", ["image", "inspect", cfg.docker.image], { stdio: "ignore" }); }
+  try { execFileSync("docker", ["image", "inspect", cfg.docker!.image], { stdio: "ignore" }); }
   catch {
-    console.log(`  building ${cfg.docker.image}…`);
-    const r = spawnSync("docker", ["build", "-t", cfg.docker.image, join(ROOT, "docker")], { stdio: "inherit" });
+    console.log(`  building ${cfg.docker!.image}…`);
+    const r = spawnSync("docker", ["build", "-t", cfg.docker!.image, join(ROOT, "docker")], { stdio: "inherit" });
     if (r.status !== 0) fail("docker build failed");
   }
-  const mounts = cfg.docker.mounts
-    .map(m => ({ ...m, hostPath: expandTilde(m.hostPath) }))
-    .filter(m => { if (existsSync(m.hostPath)) return true; console.warn(`  skipping mount ${m.hostPath} — not found`); return false; });
+  const mounts = (cfg.docker?.mounts ?? []).map(m => ({ ...m, hostPath: expandTilde(m.hostPath) })).filter(m => { if (existsSync(m.hostPath)) return true; console.warn(`  skipping mount ${m.hostPath} — not found`); return false; });
   const agentEnv: Record<string, string> = {};
-  for (const key of cfg.docker.forwardEnv) { const v = process.env[key]; if (v) agentEnv[key] = v; }
-  return docker({ imageName: cfg.docker.image, mounts, env: agentEnv });
+  for (const key of cfg.docker?.forwardEnv ?? []) { const v = process.env[key]; if (v) agentEnv[key] = v; }
+  return docker({ imageName: cfg.docker!.image, mounts, env: agentEnv });
 }
 
 // ─── Persona execution ───────────────────
 
 interface PersonaResult { persona: string; status: "done" | "failed"; findings: Finding[]; verdict: string; error?: string }
 
-async function runPersona(name: string, target: string, cfg: Config, root: string, sb: ReturnType<typeof sandbox>): Promise<PersonaResult> {
-  const pp = join(ROOT, "references", `${name}.md`);
-  if (!existsSync(pp)) return { persona: name, status: "failed", findings: [], verdict: "contest", error: `missing ${name}.md` };
-  const agent = AGENTS[cfg.provider];
-  if (!agent) return { persona: name, status: "failed", findings: [], verdict: "contest", error: `unknown provider: ${cfg.provider}` };
+async function runPersona(persona: Persona, target: string, cfg: Config, root: string, sb: ReturnType<typeof sandbox>): Promise<PersonaResult> {
   try {
     const r = await sandcastle.run({
-      agent: agent(cfg.model, { thinking: cfg.thinking === "off" ? undefined : cfg.thinking }),
-      sandbox: sb, cwd: root, name, promptFile: pp, promptArgs: { TARGET: target },
+      agent: createAgent(cfg.provider, cfg.model),
+      sandbox: sb, cwd: root, name: persona.name, promptFile: persona.path, promptArgs: { TARGET: target },
       maxIterations: 1, idleTimeoutSeconds: cfg.idleTimeoutSeconds,
       output: sandcastle.Output.object({ tag: "review", schema: ReviewSchema, maxRetries: cfg.retries }),
     });
-    return { persona: name, status: "done", findings: r.output.findings, verdict: r.output.verdict };
-  } catch (e) { return { persona: name, status: "failed", findings: [], verdict: "contest", error: String(e) }; }
+    return { persona: persona.name, status: "done", findings: r.output.findings, verdict: r.output.verdict };
+  } catch (e) { return { persona: persona.name, status: "failed", findings: [], verdict: "contest", error: String(e) }; }
 }
 
 // ─── Merge ───────────────────────────────
@@ -175,7 +192,7 @@ function mergeFindings(results: PersonaResult[]) {
 
 // ─── Verdict & Report ────────────────────
 
-function buildVerdict(results: PersonaResult[], findings: Finding[], personas: { name: string; critical: boolean }[], meta: { target: string; model: string; mode: string }) {
+function buildVerdict(results: PersonaResult[], findings: Finding[], personas: Persona[], meta: { target: string; model: string; mode: string }) {
   const breakdown = { critical: 0, high: 0, medium: 0, low: 0 };
   for (const f of findings) breakdown[f.severity]++;
   const criticalSet = new Set(personas.filter(p => p.critical).map(p => p.name));
@@ -198,7 +215,7 @@ function renderReport(results: PersonaResult[], findings: Finding[], v: ReturnTy
   return out.join("\n");
 }
 
-// ─── PR posting (was pr-comment.ts) ──────
+// ─── PR posting ──────────────────────────
 
 function postToPr(findings: Finding[], diff: string, pr: string, v: ReturnType<typeof buildVerdict>) {
   const dl = parseDiffLines(diff), anchored: { path: string; line: number; body: string }[] = [], unanchored: Finding[] = [];
@@ -224,12 +241,19 @@ const config = loadConfig(flags.config, root);
 const mode = flags.mode ?? (process.env.CI ? "local" : config.mode);
 const { target, label } = resolveTarget(flags, root);
 
-const personas = flags.personas ? config.personas.filter(p => flags.personas!.split(",").map(s => s.trim()).includes(p.name)) : config.personas;
+let personas = discoverPersonas();
+if (!personas.length) fail(`no persona files found in ${REFERENCES}`);
+if (flags.personas) {
+  const subset = new Set(flags.personas.split(",").map(s => s.trim()));
+  personas = personas.filter(p => subset.has(p.name));
+  if (!personas.length) fail(`no matching personas (available: ${discoverPersonas().map(p => p.name).join(", ")})`);
+}
+
 const sb = sandbox(mode, config);
 
 const results: PersonaResult[] = [];
 for (let i = 0; i < personas.length; i += config.concurrency) {
-  results.push(...await Promise.all(personas.slice(i, i + config.concurrency).map(p => runPersona(p.name, target, config, root, sb))));
+  results.push(...await Promise.all(personas.slice(i, i + config.concurrency).map(p => runPersona(p, target, config, root, sb))));
 }
 
 const findings = mergeFindings(results);
