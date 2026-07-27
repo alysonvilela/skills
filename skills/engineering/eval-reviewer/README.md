@@ -49,17 +49,20 @@ Spawn independent reviewer agents, wait for completion via file-based hooks, and
                 ┌───────────────────┐
                 │   Merge Results   │
                 │                   │
-                │  PASS / CONTESTED │
-                │  / REJECT         │
+                │ PASS / CONTESTED  │
+                │ / REJECT /        │
+                │ INCOMPLETE        │
                 └───────────────────┘
 ```
 
+Personas launch in batches of 4 concurrent (`MAX_CONCURRENT_AGENTS`); with all 6 selected that's two sequential batches, each fully awaited before the next starts — not one instant fan-out of six.
+
 ## How It Works
 
-1. **Spawn** — The orchestrator launches each persona as an independent agent via `qwen` CLI in headless mode
-2. **Wait** — Orchestrator polls for `done.json` completion hooks in `.eval-reviewer/{persona}/`
-3. **Merge** — All findings are deduplicated, ranked by severity, and compiled into a unified report
-4. **Verdict** — Output: **PASS** (all clean), **CONTESTED** (mixed findings), or **REJECT** (critical issues)
+1. **Spawn** — The orchestrator launches each persona as an independent subprocess via the configured spawn strategy (default: `qwen` CLI headless, auto-approving with `--yolo`; `claude` with `--dangerously-skip-permissions` is the other implemented option — `generic` is an unfinished stub that always errors)
+2. **Wait** — Orchestrator polls for `done.json` completion hooks in `.eval-reviewer/{persona}/`, relative to the skill's own directory, not the reviewed repo
+3. **Merge** — All findings are deduplicated, ranked by severity, and compiled into a unified report — this step is plain code, not an LLM call
+4. **Verdict** — **PASS** (all clean), **CONTESTED** (mixed findings), **REJECT** (critical issues), or **INCOMPLETE** (a critical persona — skeptic, architect, or security — timed out)
 
 ## Personas
 
@@ -93,12 +96,14 @@ bun scripts/orchestrator.ts /path/to/diff.md --strategy claude
 ### NPM Scripts
 
 ```bash
-npm run review              # All personas
-npm run review:quick        # Reduced timeout (120s)
-npm run review:skeptic      # Skeptic only
-npm run review:core         # Skeptic + Architect + Minimalist
-npm run review:security     # Security only
+npm run review -- /path/to/diff.md              # All personas
+npm run review:quick -- /path/to/diff.md        # Reduced timeout (120s)
+npm run review:skeptic -- /path/to/diff.md      # Skeptic only
+npm run review:core -- /path/to/diff.md         # Skeptic + Architect + Minimalist
+npm run review:security -- /path/to/diff.md     # Security only
 ```
+
+None of these scripts bake in a target — the `--` is required, or the orchestrator exits immediately on a missing-argument usage error.
 
 ## Output
 
@@ -152,7 +157,10 @@ To publish your own version of this skill:
 ## Requirements
 
 - [Bun](https://bun.sh/) runtime
-- [Qwen Code](https://github.com/nicholasgriffintn/qwen) CLI (default spawn strategy)
+- [Qwen Code](https://github.com/nicholasgriffintn/qwen) CLI (default spawn strategy), or the `claude` CLI for `--strategy claude`
+- `gh` CLI if you're feeding it a GitHub PR — the orchestrator only accepts a local file path or inline text, it doesn't fetch URLs itself
+
+Both spawn strategies run the reviewer CLI with permission checks off (`qwen --yolo`, `claude --dangerously-skip-permissions`). The persona prompts are reviewer-only by instruction, not by sandboxing.
 
 ## License
 

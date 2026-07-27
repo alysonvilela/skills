@@ -1,22 +1,57 @@
 ---
 name: eval-reviewer
-description: Multi-agent parallel code review with 6 specialized personas. Spawns independent reviewer agents, waits for completion via file-based hooks, merges findings into a unified report.
+description: Use when you want an adversarial code review from multiple independent angles at once. Six personas (skeptic, architect, minimalist, security, performance, test-coverage) each run in an isolated subprocess with no visibility into each other's findings, then a deterministic merge step dedupes and ranks them into one report with a PASS/CONTESTED/REJECT/INCOMPLETE verdict. Use when the user says "review this", "evaluate this code", asks for a second opinion on a diff or PR, or runs the CLI directly.
+license: MIT
 ---
 
 # Eval Reviewer
 
-Trigger a **multi-agent parallel code review** where 6 specialized personas independently analyze a diff or codebase. Each agent runs in isolation, writes a completion hook (`done.json`), and results are merged into a single verdict.
+Six personas review the same diff independently and simultaneously — no persona sees another's findings before writing its own, so nothing anchors on anything else. The merge step that follows is plain code, not an LLM: same findings in, same verdict out, every time.
 
-## When to Use
+## The one rule
 
-- User asks for a code review of a PR, diff, or codebase
-- User wants adversarial review from multiple perspectives
-- User says "review this", "evaluate this code", or runs the CLI directly
+You run the orchestrator and present what it produces. You do not review the code yourself — that's what the six subprocess personas are for — and you do not hand-edit `scripts/orchestrator.ts` or `scripts/spawn-agent.ts` mid-task to route around a problem. If the tool misbehaves, that's a bug to report, not a patch to make silently.
 
-## Personas
+## Steps
+
+### 1 — Get the target onto disk
+
+The orchestrator takes a **file path** (or literal inline text passed as the argument) — never a URL, and it does not fetch anything itself.
+
+- Local diff: `git diff main...HEAD > /tmp/eval-review-target.md`
+- GitHub PR: `gh pr diff <url> > /tmp/eval-review-target.md`
+- Existing file or codebase: pass the path directly
+
+**Done when:** you have a path to the complete diff or code — not a summary of it.
+
+### 2 — Run the orchestrator
+
+```bash
+bun scripts/orchestrator.ts <target> [--personas a,b,c] [--timeout 300] [--strategy qwen]
+```
+
+Defaults: all 6 personas, 300s timeout each, `qwen` CLI headless. Only `qwen` and `claude` are implemented — `generic` is an unfinished stub that always writes an error result, don't select it.
+
+Personas launch in batches of 4 concurrent, and the orchestrator waits for each batch to fully exit before starting the next — with all 6 selected, that's two sequential batches, not one instant fan-out of six. Budget wait time accordingly.
+
+Both spawn strategies run the reviewer CLI in an auto-approve mode (`qwen --yolo`, `claude --dangerously-skip-permissions`). The persona prompt instructs "review only, never edit" but nothing at the process level enforces that — don't point this at a target you wouldn't hand to an unsupervised agent.
+
+**Done when:** the process has exited. Its exit code is the verdict: `0`=PASS, `1`=CONTESTED, `2`=REJECT, `3`=INCOMPLETE.
+
+### 3 — Read the output
+
+Written inside **this skill's own directory**, not the target repo: `.eval-reviewer/report.md` and `.eval-reviewer/verdict.json`, sitting next to `scripts/`. If a persona timed out, `verdict.json`'s `agents` map shows which one and that its `status` isn't `"done"`.
+
+**Done when:** you've read both — the markdown is for the user, the JSON has the structured breakdown you need to reason about the verdict.
+
+### 4 — Present
+
+Show the report to the user. If the verdict is `INCOMPLETE`, say which personas didn't finish *before* anything else — an `INCOMPLETE` that reads like a clean `REJECT` is a different claim than one with full coverage, and whoever reads it needs to know which they're getting.
+
+## Personas (references in `references/`)
 
 | Persona | Focus | Catches |
-|---------|-------|---------|
+|---|---|---|
 | **Skeptic** | Correctness, completeness | Bugs, race conditions, unhandled errors, unproven assumptions |
 | **Architect** | Structural fitness | Coupling, boundary violations, scaling assumptions, responsibility leaks |
 | **Minimalist** | Necessity, simplicity | Over-engineering, premature abstraction, dead complexity |
@@ -24,54 +59,19 @@ Trigger a **multi-agent parallel code review** where 6 specialized personas inde
 | **Performance** | Bottlenecks, efficiency | Blocking calls, N+1 queries, memory leaks, thread misuse |
 | **Test Coverage** | Scenario completeness | Missing edge cases, weak assertions, untested error paths |
 
-## How to Run
+`skeptic`, `architect`, and `security` are the critical personas — if any of those three time out, the verdict is forced to `INCOMPLETE` regardless of what the others found.
 
-### CLI (automation)
-```bash
-bun scripts/orchestrator.ts <path-to-diff-or-code>
-# Optional: select specific personas
-bun scripts/orchestrator.ts <path> --personas skeptic,architect,security
-# Optional: timeout per agent in seconds (default: 300)
-bun scripts/orchestrator.ts <path> --timeout 600
-```
+## Report
 
-### Inline (interactive)
-When the user asks for a review, run the orchestrator with the target file or diff:
-```bash
-bun scripts/orchestrator.ts /path/to/diff.md
-```
+`report.md`: a verdict line, a severity-count table, an agent-status table (persona / status / finding count / that persona's own verdict), then findings grouped and sorted by severity.
 
-## How It Works
-
-1. **Spawn** — Orchestrator launches each persona as an independent agent via the configured spawn strategy (default: `qwen` CLI headless)
-2. **Wait** — Orchestrator polls for `done.json` completion hooks in `.eval-reviewer/{persona}/`
-3. **Merge** — All findings are deduplicated, ranked by severity, and compiled into a unified report
-4. **Verdict** — Output: PASS (all clean), CONTESTED (mixed findings), or REJECT (critical issues)
-
-## Output Format
-
-The orchestrator writes results to:
-- `.eval-reviewer/report.md` — Full markdown report with all findings
-- `.eval-reviewer/verdict.json` — Structured verdict with severity breakdown
-
-Each agent writes to `.eval-reviewer/{persona}/done.json`:
+`verdict.json`:
 ```json
 {
-  "persona": "skeptic",
-  "status": "done",
-  "findings": [
-    {
-      "severity": "high",
-      "file": "src/example.ts",
-      "line": 42,
-      "message": "Unhandled rejection if cancel() throws",
-      "suggestion": "Wrap in try/catch or use .catch()"
-    }
-  ],
-  "verdict": "contest"
+  "overall": "PASS|CONTESTED|REJECT|INCOMPLETE",
+  "breakdown": { "critical": 0, "high": 0, "medium": 0, "low": 0 },
+  "agents": { "skeptic": { "status": "done", "findings": 2, "verdict": "contest" } },
+  "target": "...",
+  "timestamp": "..."
 }
 ```
-
-## Reference Files
-
-Persona-specific prompts are in `references/{persona}.md`. Read these to understand what each agent is instructed to look for.

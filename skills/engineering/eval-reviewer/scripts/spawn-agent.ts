@@ -104,38 +104,8 @@ ${targetContent}
 ## Instructions
 
 1. Read and analyze the code above through your ${persona} lens.
-2. Identify findings with severity levels (critical, high, medium, low).
-3. Write your results to \`done.json\` in this exact format:
-
-\`\`\`json
-{
-  "persona": "${persona}",
-  "status": "done",
-  "findings": [
-    {
-      "severity": "high",
-      "file": "relative/path/from/diff",
-      "line": 42,
-      "message": "Clear description of the issue",
-      "suggestion": "Specific fix suggestion"
-    }
-  ],
-  "verdict": "pass|contest|reject"
-}
-\`\`\`
-
-4. If you find nothing, write:
-
-\`\`\`json
-{
-  "persona": "${persona}",
-  "status": "done",
-  "findings": [],
-  "verdict": "pass"
-}
-\`\`\`
-
-5. ONLY write the JSON to done.json. Do not write anything else.
+2. Write your results to \`done.json\` in the exact format given in your Output Format section above. If you find nothing, that's still a result — write \`"findings": []\` and \`"verdict": "pass"\`, don't skip the file.
+3. ONLY write the JSON to done.json. Do not write anything else.
 `;
 }
 
