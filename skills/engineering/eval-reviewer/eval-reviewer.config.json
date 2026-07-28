@@ -1,4 +1,4 @@
 {
-  "provider": "claude-code",
-  "model": "claude-sonnet-4-6"
+  "provider": "pi",
+  "model": "omniroute/free-stack"
 }
