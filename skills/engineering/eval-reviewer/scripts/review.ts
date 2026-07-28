@@ -193,7 +193,7 @@ async function runPersona(persona: Persona, tgt: Target, cfg: Config, root: stri
       sandbox: sb, cwd: root, name: persona.name, promptFile: persona.path,
       promptArgs: { TARGET: tgt.target, DIFF_STAT: tgt.diffStat, BASE_REF: tgt.baseRef },
       maxIterations: 1, idleTimeoutSeconds: cfg.idleTimeoutSeconds,
-      logging: { type: "stdout" },
+      logging: { type: "stdout", verbose: true },
       output: sandcastle.Output.object({ tag: "review", schema: ReviewSchema, maxRetries: cfg.retries }),
     });
     return { persona: persona.name, status: "done", findings: r.output.findings, verdict: r.output.verdict };
